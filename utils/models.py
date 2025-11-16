@@ -17,6 +17,15 @@ from sqlalchemy import (
     Text,
     func,
     Enum as SAEnum,
+    Column,
+    String,
+    Integer,
+    LargeBinary,
+    DateTime,
+    ForeignKey,
+    Index,
+    JSON,
+    func
 )
 
 
@@ -30,6 +39,26 @@ class PrivacyLevel(str, Enum):
     DEFAULT = "default"
     STRICT = "strict"
     CUSTOM = "custom"
+
+class Project(SQLModel, table=True):
+    __tablename__ = "project"
+    __table_args__ = (
+        Index("ix_project_created_at", "created_at"),
+    )
+
+    id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(String(36), primary_key=True, nullable=False),
+    )
+    name: Optional[str] = Field(default=None, sa_column=Column(String(255), nullable=True))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
+
+    def public_dict(self):
+        return {"id": str(self.id), "name": self.name, "created_at": self.created_at.isoformat()}
+
 
 
 class User(SQLModel, table=True):
@@ -120,6 +149,119 @@ class User(SQLModel, table=True):
             if self.last_login_at
             else None,
         }
+
+
+# recently added by harsh 
+
+class Image(SQLModel, table=True):
+    __tablename__ = "image"
+    __table_args__ = (
+        # index for uploader lookup
+        Index("ix_image_uploader_user_id", "uploader_user_id"),
+        # index for creation time
+        Index("ix_image_created_at", "created_at"),
+        # index for retention expiration checks
+        Index("ix_image_retention_expires_at", "retention_expires_at"),
+        # Unique index on (project_id, sha256_hash) to dedupe within a project
+        Index("ux_image_project_sha256", "project_id", "sha256_hash", unique=True),
+    )
+
+    # Primary key as UUID string
+    id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(String(36), primary_key=True, nullable=False),
+    )
+
+    # Foreign keys
+    project_id: UUID = Field(
+        sa_column=Column(String(36), ForeignKey("project.id", ondelete="CASCADE"), nullable=False)
+    )
+    uploader_user_id: UUID = Field(
+        sa_column=Column(String(36), ForeignKey("user.id", ondelete="SET NULL"), nullable=True)
+    )
+
+    # S3 object key (do NOT store full URL)
+    object_key: str = Field(sa_column=Column(String(1024), nullable=False))
+
+    # Original filename (optional)
+    file_name: Optional[str] = Field(default=None, sa_column=Column(String(1024), nullable=True))
+
+    # MIME type e.g. image/png
+    mime_type: Optional[str] = Field(default=None, sa_column=Column(String(128), nullable=True))
+
+    # image dimensions
+    width: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+    height: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+
+    # storage size in bytes
+    size_bytes: Optional[int] = Field(default=None, sa_column=Column(Integer, nullable=True))
+
+    # content-address hash (hex string)
+    sha256_hash: str = Field(sa_column=Column(String(128), nullable=False))
+
+    # hashing algorithm used (default sha256)
+    content_hash_algo: str = Field(default="sha256", sa_column=Column(String(32), nullable=False))
+
+    # optionally store encrypted EXIF JSON blob (AES envelope encrypted)
+    exif_metadata_encrypted: Optional[bytes] = Field(
+        default=None, sa_column=Column(LargeBinary, nullable=True)
+    )
+
+    # S3 version id if object versioning enabled
+    s3_version_id: Optional[str] = Field(default=None, sa_column=Column(String(255), nullable=True))
+
+    # soft-delete flag
+    is_deleted: bool = Field(default=False, sa_column=Column(Integer, nullable=False, server_default="0"))
+
+    # retention expiry timestamp (for automatic purge workflows)
+    retention_expires_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+
+    # derived sensitivity/scan flags (nsfw, face_detected, license_restriction, etc.)
+    # JSON is convenient and flexible; you can also map to an enum/set column if needed.
+    sensitivity_flags: Optional[Dict] = Field(
+        default=None, sa_column=Column(JSON, nullable=True)
+    )
+
+    # timestamps
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
+
+    # uploaded_at: when the uploader uploaded the file (could be same as created_at)
+    uploaded_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+
+    def public_dict(self) -> dict:
+        """
+        Safe public representation — intentionally omits encrypted EXIF and internal bytes.
+        """
+        return {
+            "id": str(self.id),
+            "project_id": str(self.project_id),
+            "uploader_user_id": str(self.uploader_user_id) if self.uploader_user_id else None,
+            "object_key": self.object_key,
+            "file_name": self.file_name,
+            "mime_type": self.mime_type,
+            "width": self.width,
+            "height": self.height,
+            "size_bytes": self.size_bytes,
+            "content_hash_algo": self.content_hash_algo,
+            # we include the hash to allow content-address lookups; remove if you want more privacy
+            "sha256_hash": self.sha256_hash,
+            "s3_version_id": self.s3_version_id,
+            "is_deleted": bool(self.is_deleted),
+            "retention_expires_at": self.retention_expires_at.isoformat() if self.retention_expires_at else None,
+            "sensitivity_flags": self.sensitivity_flags,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "uploaded_at": self.uploaded_at.isoformat() if self.uploaded_at else None,
+        }
+
+
+## done 
 
 
 class ConsentVersion(SQLModel, table=True):
