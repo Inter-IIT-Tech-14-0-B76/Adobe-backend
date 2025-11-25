@@ -1,14 +1,13 @@
-import os
-import dotenv
-
-from fastapi import FastAPI
 import logging
+import os
+
+import dotenv
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-import config
-from app.router import router
-from app.user_router import user_router
-from utils.db import init_db
+from app.routers.image import image_router
+from app.routers.user import user_router
+from app.utils.db import init_db
 
 dotenv.load_dotenv()
 
@@ -27,6 +26,8 @@ async def on_startup():
 origins = [
     "http://localhost:3000",
     "http://localhost:8000",
+    "http://localhost:*",  # For Flutter mobile/desktop
+    "http://127.0.0.1:*",  # For Flutter mobile/desktop
 ]
 
 
@@ -43,5 +44,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(router)
+app.include_router(image_router)
 app.include_router(user_router, prefix="/user")

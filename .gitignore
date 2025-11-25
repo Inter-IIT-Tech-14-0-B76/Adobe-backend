@@ -1,3 +1,4 @@
+
 # These are some examples of commonly ignored file patterns.
 # You should customize this list as applicable to your project.
 # Learn more about .gitignore:
@@ -50,9 +51,14 @@ Thumbs.db
 
 
 ## Python
+env
 .env
 service-account.json 
 bigquery-service-account.json
 __pycache__/
-.venv/
+venv/
 GoogleConfig.js
+dev.db
+rootkey.csv 
+*.DS_Store
+

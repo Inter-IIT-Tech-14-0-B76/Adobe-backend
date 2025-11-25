@@ -1,48 +1,37 @@
 from __future__ import annotations
 
-import os
 import logging
 from typing import AsyncGenerator, Optional
 
-from sqlmodel import SQLModel, select
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
 from sqlalchemy import event
-from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlmodel import SQLModel, select
 
-from utils.models import User  # ensure this imports all models or import the module
+from app.utils.models import User
+from config import DATABASE_URL, ENV
 
 logger = logging.getLogger(__name__)
 
-ENV = os.getenv("ENV", "dev").lower()
-
-if ENV == "dev":
-    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./dev.db")
-else:
-    DATABASE_URL = os.getenv(
-        "DATABASE_URL",
-        "postgresql+asyncpg://postgres:password@localhost:5432/mydb",
-    )
-
 engine_kwargs = {
-    "echo": True if ENV == "dev" else False,
-    "pool_pre_ping": True if not ENV == "dev" else False,
+    "echo": ENV == "dev",
+    "pool_pre_ping": ENV != "dev",
 }
 
-connect_args = {}
+# SQLite-specific connect_args
 if DATABASE_URL.startswith("sqlite"):
-    connect_args = {"connect_args": {"check_same_thread": False}}
-    engine_kwargs.update(connect_args)
+    engine_kwargs.update({"connect_args": {"check_same_thread": False}})
 
 engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 
-# after engine = create_async_engine(...)
+# Log resolved DB URL
 logger.info("DATABASE_URL resolved to: %s", str(engine.url))
 
+# Enable foreign key support for SQLite
 if DATABASE_URL.startswith("sqlite"):
 
     @event.listens_for(engine.sync_engine, "connect")
-    def _sqlite_enable_foreign_keys(dbapi_connection, connection_record):
+    def _sqlite_enable_foreign_keys(dbapi_connection, connection_record) -> None:  # type: ignore[override]
         try:
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
@@ -62,14 +51,14 @@ AsyncSessionLocal = sessionmaker(
 
 async def async_session() -> AsyncGenerator[AsyncSession, None]:
     """
-    Use in routes:
+    Dependency for FastAPI routes:
 
-        async with async_session() as session:
+        async def route(session: AsyncSession = Depends(async_session)):
             ...
 
-    or
+    Or manual usage:
 
-        def route(session: AsyncSession = Depends(async_session)):
+        async with async_session() as session:
             ...
     """
     session: AsyncSession = AsyncSessionLocal()
@@ -81,16 +70,14 @@ async def async_session() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """
-    Call at FastAPI startup (for development OR first deployment).
-    For real production use Alembic migrations.
+    Initialize database tables (for dev / first deployment).
+    In real production, use Alembic migrations instead of this.
     """
-    # Ensure all model modules imported before calling create_all()
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
     logger.info("Database initialized (tables created if missing).")
 
 
-# Convenience helpers
 async def get_user_by_firebase_uid(
     session: AsyncSession, firebase_uid: str
 ) -> Optional[User]:

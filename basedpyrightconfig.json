@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Deteks/basedpyright/main/schema/basedpyright.schema.json",
+  "venvPath": ".",
+  "venv": ".venv",
+
+  "include": ["app", "main.py", "config.py"],
+  "exclude": ["**/__pycache__", ".venv", "build", "dist", "*.db", ".git"],
+
+  "typeCheckingMode": "basic",
+
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false,
+  "reportGeneralTypeIssues": "warning",
+  "reportOptionalMemberAccess": "warning",
+
+  "pythonVersion": "3.10",
+  "pythonPlatform": "Linux",
+
+  "executionEnvironments": [
+    {
+      "root": "app",
+      "extraPaths": ["."]
+    }
+  ]
+}

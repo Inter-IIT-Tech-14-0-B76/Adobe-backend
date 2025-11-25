@@ -1,14 +1,14 @@
-from typing import Dict, Optional
 from datetime import datetime, timezone
+from typing import Dict, Optional
 
-from fastapi import Request, HTTPException, status, Depends
+from fastapi import HTTPException, Request, status
 from firebase_admin import auth as firebase_auth
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from utils.db import async_session
-from utils.models import User, PrivacyLevel
+from app.utils.models import PrivacyLevel, User
+from sprint import sprint
 
 
 async def verify_firebase_token(request: Request) -> Dict:
@@ -26,7 +26,7 @@ async def verify_firebase_token(request: Request) -> Dict:
     try:
         decoded = firebase_auth.verify_id_token(id_token)
         return decoded
-    except Exception as exc:
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Token verification failed"
         )
@@ -38,6 +38,7 @@ async def upsert_user_from_token(
     *,
     set_last_login: bool = True,
     default_privacy: PrivacyLevel = PrivacyLevel.DEFAULT,
+    display_name_override: Optional[str] = None,
 ) -> User:
     """
     Find or create (upsert) a User row based on firebase uid inside token_payload.
@@ -46,13 +47,22 @@ async def upsert_user_from_token(
     """
     uid = token_payload["uid"]
     stmt = select(User).where(User.firebase_uid == uid)
-    result = await session.exec(stmt)
+    result = await session.execute(stmt)
     user = result.scalar_one_or_none()
 
     now = datetime.now(timezone.utc)
     mirrored_email = token_payload.get("email")
     email_verified = bool(token_payload.get("email_verified", False))
-    display_name = token_payload.get("name") or token_payload.get("displayName")
+    display_name = (
+        display_name_override
+        or token_payload.get("name")
+        or token_payload.get("displayName")
+    )
+
+    sprint(f"upsert: display_name_override = {display_name_override}", "d")
+    sprint(f"upsert: token name = {token_payload.get('name')}", "d")
+    sprint(f"upsert: token displayName = {token_payload.get('displayName')}", "d")
+    sprint(f"upsert: final display_name = {display_name}", "d")
 
     if user is None:
         user = User(
@@ -64,16 +74,15 @@ async def upsert_user_from_token(
             updated_at=now,
             last_login_at=now if set_last_login else None,
             privacy_level=default_privacy,
-            status=user_status_active(),  # helper below (or replace with UserStatus.ACTIVE)
+            status=user_status_active(),
         )
         session.add(user)
         try:
             await session.commit()
             await session.refresh(user)
         except IntegrityError:
-            # race: someone else created it — re-query and return
             await session.rollback()
-            result = await session.exec(stmt)
+            result = await session.execute(stmt)
             user = result.scalar_one()
     else:
         updated = False
@@ -96,9 +105,6 @@ async def upsert_user_from_token(
     return user
 
 
-# tiny compatibility helper used above (avoid circular import)
 def user_status_active():
-    # import inside function to avoid circular import if necessary
-    from app.models import UserStatus
-
+    from app.utils.models import UserStatus
     return UserStatus.ACTIVE
