@@ -410,3 +410,9 @@ async def delete_project(
     await session.delete(project)
     await session.commit()
     return {"message": "Project and all history deleted successfully"}
+
+
+@image_router.get("/", summary="Root endpoint", response_model=dict)
+async def root():
+    """Root endpoint that returns a welcome message."""
+    return {"message": "Go For Gold!!!"}
