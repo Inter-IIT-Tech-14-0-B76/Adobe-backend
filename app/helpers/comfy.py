@@ -45,6 +45,12 @@ def load_workflow_template(workspace_name: str) -> Dict[str, Any]:
 
     For workspace_name="default", expects a file:
         COMFY_WORKFLOW_DIR / "default.json"
+
+    Returns the full workflow dict containing:
+        - "workflow": dict of nodes
+        - "input_fields": list of paths for image injection
+        - "text_input_fields": list of paths for text/prompt injection
+        - "description": optional description
     """
     workspace_name = workspace_name or DEFAULT_WORKSPACE
     wf_path = COMFY_WORKFLOW_DIR / f"{workspace_name}.json"
@@ -58,67 +64,127 @@ def load_workflow_template(workspace_name: str) -> Dict[str, Any]:
         raise ComfyError(f"Failed to load workflow template {wf_path}: {e}") from e
 
 
-def inject_image_filename(
-    workflow: Dict[str, Any],
-    image_filename: str,
-    load_node_id: Optional[str] = None,
+def _traverse_and_set(
+    root: Dict[str, Any],
+    field_path: str,
+    value: Any,
 ) -> None:
     """
-    Update the workflow so that its LoadImage node points to the given filename.
+    Traverse a nested dict/list structure and set a value at the given path.
 
-    If load_node_id is provided, uses that node id.
-    Otherwise:
-      - tries to find the first node with class_type containing "LoadImage"
-        or inputs["image"] being a string.
+    Args:
+        root: The root dict (e.g., workflow["workflow"])
+        field_path: Dot-separated path like "10.inputs.image"
+        value: The value to set
     """
-    if load_node_id and load_node_id in workflow:
-        workflow[load_node_id].setdefault("inputs", {})["image"] = image_filename
-        return
+    if not isinstance(field_path, str) or not field_path:
+        raise ComfyError(f"Invalid field path: {field_path!r}")
 
-    # Auto-discover a suitable node
-    for node_id, node in workflow.items():
-        class_type = node.get("class_type", "") or ""
-        inputs = node.get("inputs", {}) or {}
+    parts = field_path.split(".")
+    cur = root
 
-        if "image" in inputs and isinstance(inputs["image"], str):
-            inputs["image"] = image_filename
-            return
+    # Traverse to the parent of the target
+    for i, seg in enumerate(parts[:-1]):
+        if isinstance(cur, dict):
+            if seg not in cur:
+                raise ComfyError(f"Missing key '{seg}' while traversing '{field_path}'")
+            cur = cur[seg]
+        elif isinstance(cur, list) and seg.isdigit():
+            idx = int(seg)
+            if idx < 0 or idx >= len(cur):
+                raise ComfyError(
+                    f"Index {idx} out of bounds while traversing '{field_path}'"
+                )
+            cur = cur[idx]
+        else:
+            raise ComfyError(
+                f"Unexpected structure at '{'.'.join(parts[: i + 1])}' "
+                f"while traversing '{field_path}': {type(cur).__name__}"
+            )
 
-        # Some nodes may have class_type like "LoadImage" or similar
-        if "loadimage" in class_type.lower() or "load image" in class_type.lower():
-            inputs["image"] = image_filename
-            return
+    # Set the final value
+    final_key = parts[-1]
+    if isinstance(cur, dict):
+        cur[final_key] = value
+    elif isinstance(cur, list) and final_key.isdigit():
+        idx = int(final_key)
+        if idx < 0 or idx >= len(cur):
+            raise ComfyError(
+                f"Index {idx} out of bounds for final key in '{field_path}'"
+            )
+        cur[idx] = value
+    else:
+        raise ComfyError(
+            f"Cannot set '{field_path}': expected dict or list at final container, "
+            f"got {type(cur).__name__}"
+        )
 
-    raise ComfyError(
-        "Could not find a LoadImage-like node to inject the filename into."
-    )
+
+def inject_image_filename(
+    workflow: Dict[str, Any],
+    image_filenames: List[str],
+) -> None:
+    """
+    Inject image filenames into workflow according to workflow['input_fields'].
+
+    Args:
+        workflow: Full workflow dict with "workflow" and "input_fields" keys
+        image_filenames: List of filenames to inject; must match length of input_fields
+
+    This mutates `workflow` in-place.
+    """
+    input_fields = workflow.get("input_fields", [])
+
+    if not input_fields:
+        raise ComfyError("Workflow has no 'input_fields' defined")
+
+    if len(input_fields) != len(image_filenames):
+        raise ComfyError(
+            f"Mismatch: {len(input_fields)} input_fields but {len(image_filenames)} filenames"
+        )
+
+    nodes_root = workflow.get("workflow")
+    if not isinstance(nodes_root, dict):
+        raise ComfyError("workflow['workflow'] must be a dict of nodes")
+
+    for field_path, filename in zip(input_fields, image_filenames):
+        _traverse_and_set(nodes_root, field_path, filename)
 
 
 def inject_prompt_text(
     workflow: Dict[str, Any],
     prompt_text: str,
-    text_node_id: Optional[str] = None,
 ) -> None:
     """
-    Optionally inject prompt text into the workflow.
+    Inject prompt text into the workflow using 'text_input_fields' if available,
+    otherwise fall back to finding any node with 'inputs.text'.
 
-    If text_node_id is given, tries to set workflow[text_node_id]["inputs"]["text"].
-    Otherwise, will attempt to find any node with an 'inputs.text' field.
+    Args:
+        workflow: Full workflow dict
+        prompt_text: The text/prompt to inject
     """
     if not prompt_text:
         return
 
-    if text_node_id and text_node_id in workflow:
-        workflow[text_node_id].setdefault("inputs", {})["text"] = prompt_text
+    nodes_root = workflow.get("workflow", {})
+    text_fields = workflow.get("text_input_fields", [])
+
+    # If text_input_fields is defined, use it
+    if text_fields:
+        for field_path in text_fields:
+            _traverse_and_set(nodes_root, field_path, prompt_text)
         return
 
-    # Fallback: first node with "text" in inputs
-    for node in workflow.values():
-        inputs = node.get("inputs", {}) or {}
-        if "text" in inputs:
+    # Fallback: find first node with "text" in inputs
+    for node in nodes_root.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict) and "text" in inputs:
             inputs["text"] = prompt_text
             return
-    # If no text node found, we silently ignore; some workflows are purely img2img.
+
+    # No text node found - silently ignore (some workflows are purely img2img)
 
 
 def queue_prompt(
@@ -128,13 +194,21 @@ def queue_prompt(
     """
     Send the workflow to ComfyUI /prompt and return the prompt_id.
 
-    The 'workflow' argument here should be the full graph dict, as exported from ComfyUI.
+    Args:
+        workflow: Full workflow dict containing "workflow" key with the node graph
+        client_id: Optional client identifier for tracking
+
+    Returns:
+        The prompt_id from ComfyUI
     """
     url = f"{COMFY_URL}/prompt"
     client_id = client_id or uuid.uuid4().hex
 
+    # Extract the actual node graph from our wrapper structure
+    prompt_data = workflow.get("workflow", workflow)
+
     payload = {
-        "prompt": workflow,
+        "prompt": prompt_data,
         "client_id": client_id,
     }
 
@@ -142,6 +216,15 @@ def queue_prompt(
         resp = requests.post(url, json=payload, timeout=60)
         resp.raise_for_status()
         data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        # Try to get error details from response
+        error_detail = ""
+        try:
+            error_json = e.response.json()
+            error_detail = f": {error_json}"
+        except Exception:
+            error_detail = f": {e.response.text[:500]}" if e.response.text else ""
+        raise ComfyError(f"ComfyUI rejected prompt{error_detail}") from e
     except Exception as e:
         raise ComfyError(f"Failed to queue prompt in ComfyUI: {e}") from e
 
@@ -210,6 +293,13 @@ def wait_for_images(
             continue
 
         prompt_data = history[prompt_id]
+
+        # Check for execution errors
+        status_data = prompt_data.get("status", {})
+        if status_data.get("status_str") == "error":
+            messages = status_data.get("messages", [])
+            raise ComfyError(f"ComfyUI execution failed: {messages}")
+
         outputs = prompt_data.get("outputs", {}) or {}
 
         images_bytes: List[bytes] = []
@@ -238,8 +328,6 @@ def process_image_with_comfy(
     image_path: str,
     workspace_name: Optional[str] = None,
     prompt_text: Optional[str] = None,
-    load_node_id: Optional[str] = None,
-    text_node_id: Optional[str] = None,
     timeout_seconds: float = 60.0,
 ) -> bytes:
     """
@@ -247,14 +335,20 @@ def process_image_with_comfy(
 
     1. Upload image to ComfyUI.
     2. Load workspace (workflow JSON) by name.
-    3. Inject uploaded image filename into LoadImage node.
-    4. Optionally inject prompt text.
+    3. Inject uploaded image filename using input_fields.
+    4. Optionally inject prompt text using text_input_fields.
     5. Queue /prompt.
     6. Wait for images.
     7. Return the FIRST image bytes.
 
-    For now, this assumes a single-output flow, but you can adapt it to
-    return all images if you want.
+    Args:
+        image_path: Path to the input image file
+        workspace_name: Name of workflow template (default: DEFAULT_WORKSPACE)
+        prompt_text: Optional text prompt for generation
+        timeout_seconds: Max time to wait for ComfyUI to complete
+
+    Returns:
+        Raw bytes of the first output image
     """
     upload_info = upload_image_to_comfy(image_path)
     image_name = upload_info.get("name")
@@ -264,10 +358,12 @@ def process_image_with_comfy(
     workspace_name = workspace_name or DEFAULT_WORKSPACE
     workflow = load_workflow_template(workspace_name)
 
-    inject_image_filename(workflow, image_name, load_node_id=load_node_id)
+    # Inject the uploaded filename (expects a list)
+    inject_image_filename(workflow, [image_name])
 
+    # Inject prompt if provided
     if prompt_text:
-        inject_prompt_text(workflow, prompt_text, text_node_id=text_node_id)
+        inject_prompt_text(workflow, prompt_text)
 
     prompt_id = queue_prompt(workflow)
 

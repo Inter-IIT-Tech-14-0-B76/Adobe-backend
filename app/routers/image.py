@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, Optional
+from typing import Dict, List, Optional
 from uuid import uuid4
 
 import anyio
@@ -12,7 +12,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
-from sqlmodel import desc, select
+from sqlmodel import col, select, desc
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.helpers.auth import upsert_user_from_token, verify_firebase_token
@@ -22,35 +22,45 @@ from app.helpers.s3 import (
     _s3_put_object_sync,
 )
 from app.utils.db import async_session
-from app.utils.models import Image, ImageActionType, Project
+from app.utils.models import (
+    Image, 
+    ImageActionType, 
+    Project, 
+    VersionHistory
+)
 
-image_router = APIRouter(tags=["Images"])
+image_router = APIRouter(tags=["Images and Versions"])
 
-
-def _merge_transformations(
-    parent_t: Dict[str, Any], delta_t: Dict[str, Any]
-) -> Dict[str, Any]:
-    merged = dict(parent_t)
-    for k, v in delta_t.items():
-        if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
-            merged[k] = _merge_transformations(merged[k], v)
-        else:
-            merged[k] = v
-    return merged
+async def _fetch_images_by_ids(session: AsyncSession, image_ids: List[str]) -> List[Image]:
+    """
+    Since we store IDs in a JSON blob, we must manually query the Image table
+    to get the actual objects. We rely on the order of IDs in the blob.
+    """
+    if not image_ids:
+        return []
+    
+    statement = select(Image).where(col(Image.id).in_(image_ids))
+    results = (await session.execute(statement)).scalars().all()
+    
+    image_map = {img.id: img for img in results}
+    ordered_images = [image_map[uid] for uid in image_ids if uid in image_map]
+    
+    return ordered_images
 
 
 @image_router.post(
     "/images/upload",
     status_code=201,
-    summary="Upload an image and create a new project",
-    description="Creates a new project and sets the uploaded image as the root + active image.",
+    summary="Start Project & Upload Root",
+    description="Creates a project and the first version containing this single image."
 )
 async def upload_physical_image(
     token_payload: Dict = Depends(verify_firebase_token),
-    project_id: Optional[str] = Form(None),
-    parent_image_id: Optional[str] = Form(None),
+    project_id: Optional[str] = Form(None), 
+    parent_version_id: Optional[str] = Form(None),
     file: UploadFile = File(...),
     action_type: ImageActionType = Form(ImageActionType.UPLOAD),
+    prompt: Optional[str] = Form(None),
     generation_params_str: Optional[str] = Form(None),
     session: AsyncSession = Depends(async_session),
 ):
@@ -58,178 +68,229 @@ async def upload_physical_image(
     if not uploader:
         raise HTTPException(status_code=401, detail="User invalid")
 
-    if parent_image_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Root uploads cannot set a parent_image_id.",
-        )
-
     contents = await file.read()
     sha256_hash = _compute_sha256(contents)
+    gen_params = json.loads(generation_params_str) if generation_params_str else {}
 
-    project = Project(
-        id=str(uuid4()),
-        user_id=uploader.id,
-        name=file.filename or "Untitled Project",
-    )
-    session.add(project)
-    await session.flush()
+    if project_id:
+        project = await session.get(Project, project_id)
+        if not project or project.user_id != uploader.id:
+            raise HTTPException(status_code=403, detail="Unauthorized")
+    else:
+        project = Project(
+            id=str(uuid4()),
+            user_id=uploader.id,
+            name=file.filename or "Untitled Project",
+        )
+        session.add(project)
+        await session.flush() 
 
-    object_key = f"project/{project.id}/{sha256_hash}/{file.filename or 'image'}"
+    object_key = f"project/{project.id}/assets/{sha256_hash}/{file.filename or 'image'}"
+    
     await anyio.to_thread.run_sync(
         _s3_put_object_sync, object_key, contents, file.content_type
     )
 
-    gen_params = json.loads(generation_params_str) if generation_params_str else {}
-
-    image = Image(
+    new_image = Image(
         id=str(uuid4()),
         project_id=project.id,
         object_key=object_key,
         file_name=file.filename,
         mime_type=file.content_type,
         sha256_hash=sha256_hash,
-        parent_image_id=None,
         action_type=action_type,
         is_virtual=False,
         transformations={},
         generation_params=gen_params,
     )
-    session.add(image)
-    await session.flush()
+    session.add(new_image)
+    await session.flush() 
 
-    project.active_image_id = image.id
+    new_version = VersionHistory(
+        id=str(uuid4()),
+        project_id=project.id,
+        parent_id=parent_version_id, 
+        image_ids=[new_image.id],
+        prompt=prompt,
+        output_logs="Initial upload",
+    )
+    session.add(new_version)
+    
+    await session.flush() 
+
+    project.current_version_id = new_version.id
     session.add(project)
 
     await session.commit()
-    await session.refresh(image)
+    await session.refresh(new_version)
 
-    resp = image.public_dict()
-    resp["project_id"] = str(project.id)
+    resp = new_version.public_dict()
+    resp["images"] = [new_image.public_dict()]
+    resp["images"][0]["presigned_url"] = _s3_presign_sync(new_image.object_key)
+    return resp
+
+
+@image_router.post(
+    "/images/upload/{project_id}",
+    status_code=201,
+    summary="Add image to project (New Version)",
+    description="Adds a new image to the current sequence. Does NOT duplicate existing images, just appends the ID."
+)
+async def add_image_to_project(
+    project_id: str,
+    token_payload: Dict = Depends(verify_firebase_token),
+    file: UploadFile = File(...),
+    action_type: ImageActionType = Form(ImageActionType.UPLOAD),
+    session: AsyncSession = Depends(async_session),
+):
+    uploader = await upsert_user_from_token(token_payload, session)
+    project = await session.get(Project, project_id)
+    if not project or project.user_id != uploader.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    parent_version = None
+    previous_image_ids = []
+    
+    if project.current_version_id:
+        parent_version = await session.get(VersionHistory, project.current_version_id)
+        if parent_version:
+            previous_image_ids = parent_version.image_ids.copy() 
+
+    contents = await file.read()
+    sha256_hash = _compute_sha256(contents)
+    object_key = f"project/{project.id}/assets/{sha256_hash}/{file.filename}"
+    
+    await anyio.to_thread.run_sync(
+        _s3_put_object_sync, object_key, contents, file.content_type
+    )
+
+    new_image = Image(
+        id=str(uuid4()),
+        project_id=project.id,
+        object_key=object_key,
+        file_name=file.filename,
+        mime_type=file.content_type,
+        sha256_hash=sha256_hash,
+        action_type=action_type,
+        is_virtual=False,
+    )
+    session.add(new_image)
+    await session.flush() 
+
+    new_state_ids = previous_image_ids + [new_image.id] 
+    
+    new_version = VersionHistory(
+        id=str(uuid4()),
+        project_id=project.id,
+        parent_id=parent_version.id if parent_version else None,
+        image_ids=new_state_ids, 
+        prompt=parent_version.prompt if parent_version else None,
+        output_logs="Added new image asset",
+    )
+    session.add(new_version)
+    
+    await session.flush()
+
+    project.current_version_id = new_version.id
+    session.add(project)
+    
+    await session.commit()
+
+    full_images = await _fetch_images_by_ids(session, new_state_ids)
+    
+    resp = new_version.public_dict()
+    resp["images"] = []
+    for img in full_images:
+        d = img.public_dict()
+        d["presigned_url"] = _s3_presign_sync(img.object_key)
+        resp["images"].append(d)
+        
     return resp
 
 
 @image_router.post(
     "/images/edit",
     status_code=201,
-    summary="Create a virtual image edit",
-    description="Adds a derived image that reuses the parent image file and stores transform metadata.",
+    summary="Create a new version (Edit)",
+    description="Creates a new asset for the edited image, then creates a new version pointing to [Old_Backgrounds, New_Edited_Image].",
 )
 async def create_virtual_edit(
     token_payload: Dict = Depends(verify_firebase_token),
     project_id: str = Body(...),
-    parent_image_id: str = Body(...),
+    parent_version_id: str = Body(...),
+    source_image_id: str = Body(...),
     transformations: Dict = Body(...),
+    prompt: Optional[str] = Body(None),
     session: AsyncSession = Depends(async_session),
 ):
     uploader = await upsert_user_from_token(token_payload, session, set_last_login=True)
-    if not uploader:
-        raise HTTPException(status_code=401, detail="User invalid")
-
     project = await session.get(Project, project_id)
     if not project or project.user_id != uploader.id:
-        raise HTTPException(status_code=403, detail="Unauthorized or project not found")
+        raise HTTPException(status_code=403, detail="Unauthorized")
 
-    parent = await session.get(Image, parent_image_id)
-    if not parent or parent.project_id != project_id:
-        raise HTTPException(status_code=404, detail="Invalid parent image")
+    parent_version = await session.get(VersionHistory, parent_version_id)
+    if not parent_version:
+        raise HTTPException(status_code=404, detail="Parent version not found")
 
-    incoming = transformations or {}
+    if source_image_id not in parent_version.image_ids:
+        raise HTTPException(status_code=400, detail="Source image not in parent version")
 
-    new_image = Image(
+    source_image = await session.get(Image, source_image_id)
+    if not source_image:
+        raise HTTPException(status_code=404, detail="Source image asset missing")
+
+    new_edited_image = Image(
         id=str(uuid4()),
         project_id=project_id,
-        parent_image_id=parent_image_id,
-        object_key=parent.object_key,
-        file_name=parent.file_name,
-        mime_type=parent.mime_type,
-        sha256_hash=parent.sha256_hash,
-        transformations=incoming,
+        parent_image_id=source_image.id, 
+        object_key=source_image.object_key, 
+        file_name=source_image.file_name,
+        mime_type=source_image.mime_type,
+        sha256_hash=source_image.sha256_hash,
+        transformations=transformations, 
         action_type=ImageActionType.EDIT,
         is_virtual=True,
     )
-    session.add(new_image)
-    await session.flush()
+    session.add(new_edited_image)
+    await session.flush() 
 
-    project.active_image_id = new_image.id
-    session.add(project)
-
-    await session.commit()
-    await session.refresh(new_image)
-
-    return new_image.public_dict()
-
-
-@image_router.post(
-    "/projects/{project_id}/undo",
-    status_code=200,
-    summary="Undo last edit",
-    description="Resets active image pointer to the previous image.",
-)
-async def undo_action(
-    project_id: str,
-    token_payload: Dict = Depends(verify_firebase_token),
-    session: AsyncSession = Depends(async_session),
-):
-    uploader = await upsert_user_from_token(token_payload, session)
-    project = await session.get(Project, project_id)
-
-    if not uploader or not project or project.user_id != uploader.id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
-    current_img = await session.get(Image, project.active_image_id)
-    if not current_img or not current_img.parent_image_id:
-        raise HTTPException(status_code=400, detail="Nothing to undo")
-
-    project.active_image_id = current_img.parent_image_id
-    session.add(project)
-    await session.commit()
-
-    new_current = await session.get(Image, project.active_image_id)
-    return new_current.public_dict()
-
-
-@image_router.post(
-    "/projects/{project_id}/redo",
-    status_code=200,
-    summary="Redo last undone edit",
-    description="Moves active image pointer to the latest child image.",
-)
-async def redo_action(
-    project_id: str,
-    token_payload: Dict = Depends(verify_firebase_token),
-    session: AsyncSession = Depends(async_session),
-):
-    uploader = await upsert_user_from_token(token_payload, session)
-    project = await session.get(Project, project_id)
-
-    if not uploader or not project or project.user_id != uploader.id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
-    statement = (
-        select(Image)
-        .where(Image.parent_image_id == project.active_image_id)
-        .order_by(desc(Image.created_at))
-        .limit(1)
+    new_image_ids = [
+        uid if uid != source_image_id else new_edited_image.id 
+        for uid in parent_version.image_ids
+    ]
+    new_version = VersionHistory(
+        id=str(uuid4()),
+        project_id=project_id,
+        parent_id=parent_version_id,
+        image_ids=new_image_ids, 
+        prompt=prompt if prompt else parent_version.prompt,
+        output_logs=f"Edited image {source_image.id}",
     )
-    results = await session.execute(statement)
-    child = results.scalar_one_or_none()
-    if not child:
-        raise HTTPException(status_code=400, detail="Nothing to redo")
-
-    project.active_image_id = child.id
+    session.add(new_version)
+    
+    await session.flush() 
+    project.current_version_id = new_version.id
     session.add(project)
+    
     await session.commit()
-    await session.refresh(child)
+    await session.refresh(new_version)
 
-    return child.public_dict()
+    full_images = await _fetch_images_by_ids(session, new_image_ids)
+    
+    resp = new_version.public_dict()
+    resp["images"] = []
+    for img in full_images:
+        d = img.public_dict()
+        d["presigned_url"] = _s3_presign_sync(img.object_key)
+        resp["images"].append(d)
+        
+    return resp
 
 
 @image_router.get(
     "/projects/{project_id}/current",
     status_code=200,
-    summary="Get active image",
-    description="Returns the active image for a project including a presigned S3 URL.",
+    summary="Get current state",
 )
 async def get_current_project_state(
     project_id: str,
@@ -242,48 +303,54 @@ async def get_current_project_state(
     if not uploader or not project or project.user_id != uploader.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    if not project.active_image_id:
-        return {"message": "No active image"}
+    if not project.current_version_id:
+        return {"message": "No active history"}
 
-    image = await session.get(Image, project.active_image_id)
-    if not image:
-        raise HTTPException(status_code=404, detail="Active image missing")
+    version = await session.get(VersionHistory, project.current_version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="Version data missing")
 
-    data = image.public_dict()
-    data["presigned_url"] = _s3_presign_sync(image.object_key)
+    images = await _fetch_images_by_ids(session, version.image_ids)
+
+    data = version.public_dict()
+    image_list = []
+    for img in images:
+        img_dict = img.public_dict()
+        img_dict["presigned_url"] = _s3_presign_sync(img.object_key)
+        image_list.append(img_dict)
+        
+    data["images"] = image_list
     return data
 
 
-@image_router.get(
-    "/projects",
-    status_code=200,
-    summary="List user's projects",
-    description="Returns all projects owned by the authenticated user.",
-)
-async def list_user_projects(
-    token_payload: Dict = Depends(verify_firebase_token),
-    session: AsyncSession = Depends(async_session),
-):
+@image_router.post("/projects/{project_id}/undo", status_code=200)
+async def undo_action(project_id: str, token_payload: Dict = Depends(verify_firebase_token), session: AsyncSession = Depends(async_session)):
     uploader = await upsert_user_from_token(token_payload, session)
-    if not uploader:
-        raise HTTPException(status_code=401, detail="User invalid")
+    project = await session.get(Project, project_id)
+    if not project or project.user_id != uploader.id: raise HTTPException(status_code=403, detail="Auth Error")
 
-    statement = (
-        select(Project)
-        .where(Project.user_id == uploader.id)
-        .order_by(desc(Project.created_at))
-    )
-    projects = (await session.execute(statement)).scalars().all()
-    return [p.public_dict() for p in projects]
+    current = await session.get(VersionHistory, project.current_version_id)
+    if not current or not current.parent_id:
+        raise HTTPException(status_code=400, detail="Cannot undo")
+    
+    project.current_version_id = current.parent_id
+    session.add(project)
+    await session.commit()
 
+    parent = await session.get(VersionHistory, current.parent_id)
+    images = await _fetch_images_by_ids(session, parent.image_ids)
+    
+    data = parent.public_dict()
+    data["images"] = [i.public_dict() for i in images]
+    return data
 
-@image_router.get(
-    "/projects/{project_id}",
+@image_router.post(
+    "/projects/{project_id}/redo",
     status_code=200,
-    summary="Get project details",
-    description="Returns full metadata for a specific project.",
+    summary="Redo (Go to latest child version)",
+    description="Moves the project state forward to the most recently created child version."
 )
-async def get_project(
+async def redo_action(
     project_id: str,
     token_payload: Dict = Depends(verify_firebase_token),
     session: AsyncSession = Depends(async_session),
@@ -294,14 +361,41 @@ async def get_project(
     if not uploader or not project or project.user_id != uploader.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    return project.public_dict()
+    if not project.current_version_id:
+        raise HTTPException(status_code=400, detail="Current version is null")
 
+    statement = (
+        select(VersionHistory)
+        .where(VersionHistory.parent_id == project.current_version_id)
+        .order_by(desc(VersionHistory.created_at))
+        .limit(1)
+    )
+    results = await session.execute(statement)
+    child_version = results.scalar_one_or_none()
+    
+    if not child_version:
+        raise HTTPException(status_code=400, detail="Nothing to redo (no child version found)")
+
+    project.current_version_id = child_version.id
+    session.add(project)
+    await session.commit()
+
+    full_images = await _fetch_images_by_ids(session, child_version.image_ids)
+
+    resp = child_version.public_dict()
+    resp["images"] = []
+    for img in full_images:
+        d = img.public_dict()
+        d["presigned_url"] = _s3_presign_sync(img.object_key)
+        resp["images"].append(d)
+
+    return resp
 
 @image_router.delete(
     "/projects/{project_id}",
     status_code=200,
     summary="Delete a project",
-    description="Deletes the project and all associated images.",
+    description="Deletes the project, its entire version history, and all image asset records.",
 )
 async def delete_project(
     project_id: str,
@@ -313,31 +407,6 @@ async def delete_project(
 
     if not uploader or not project or project.user_id != uploader.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
-
     await session.delete(project)
     await session.commit()
-    return {"message": "Project deleted successfully"}
-
-
-@image_router.get(
-    "/projects/{project_id}/images",
-    status_code=200,
-    summary="Get all images in a project",
-    description="Returns all images in a project ordered by creation time.",
-)
-async def get_project_images(
-    project_id: str,
-    token_payload: Dict = Depends(verify_firebase_token),
-    session: AsyncSession = Depends(async_session),
-):
-    uploader = await upsert_user_from_token(token_payload, session)
-    project = await session.get(Project, project_id)
-
-    if not uploader or not project or project.user_id != uploader.id:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-
-    statement = (
-        select(Image).where(Image.project_id == project_id).order_by(Image.created_at)
-    )
-    images = (await session.execute(statement)).scalars().all()
-    return [img.public_dict() for img in images]
+    return {"message": "Project and all history deleted successfully"}

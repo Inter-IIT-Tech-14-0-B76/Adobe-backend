@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from fastapi import HTTPException, Request, status
 from firebase_admin import auth as firebase_auth
@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.utils.models import PrivacyLevel, User
+from app.utils.models import Image, PrivacyLevel, Project, User
 from sprint import sprint
 
 
@@ -107,4 +107,46 @@ async def upsert_user_from_token(
 
 def user_status_active():
     from app.utils.models import UserStatus
+
     return UserStatus.ACTIVE
+
+
+async def get_image(
+    project_id: str,
+    token_payload: Dict,
+    session: AsyncSession,
+) -> Tuple[User, Image, Project]:
+    """
+    Validate user authorization and retrieve the active image for a project.
+
+    Returns:
+        Tuple of (uploader, active_image, project)
+
+    Raises:
+        HTTPException: If user is invalid, not authorized, or image not found
+    """
+    uploader = await upsert_user_from_token(token_payload, session, set_last_login=True)
+
+    if not uploader:
+        raise HTTPException(status_code=401, detail="User invalid")
+
+    project = await session.get(Project, project_id)
+    sprint(f"Project, user, {project_id}, {project}")
+    if not project or project.user_id != uploader.id:
+        raise HTTPException(
+            status_code=403, detail="Not authorized to process this project"
+        )
+
+    if not project.active_image_id:
+        raise HTTPException(
+            status_code=400, detail="Project has no active image to process"
+        )
+
+    active_image = await session.get(Image, project.active_image_id)
+    if not active_image:
+        raise HTTPException(status_code=404, detail="Active image not found")
+
+    if not active_image.object_key:
+        raise HTTPException(status_code=400, detail="Active image has no S3 object_key")
+
+    return uploader, active_image, project

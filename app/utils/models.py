@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 
 # --- ENUMS ---
 
-
 class UserStatus(str, Enum):
     ACTIVE = "active"
     SUSPENDED = "suspended"
@@ -44,6 +43,8 @@ class ImageActionType(str, Enum):
     GENERATE = "generate"
     EDIT = "edit"
 
+
+# --- MODELS ---
 
 class ConsentVersion(SQLModel, table=True):
     __tablename__ = "consentversion"
@@ -94,7 +95,6 @@ class User(SQLModel, table=True):
         default=UserStatus.ACTIVE,
         sa_column=Column(SAEnum(UserStatus, name="user_status"), nullable=False),
     )
-
     consent_version_id: Optional[str] = Field(
         default=None,
         sa_column=Column(
@@ -103,7 +103,6 @@ class User(SQLModel, table=True):
             nullable=True,
         ),
     )
-
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(
@@ -150,11 +149,88 @@ class User(SQLModel, table=True):
         }
 
 
+class VersionHistory(SQLModel, table=True):
+    __tablename__ = "version_history"
+    __table_args__ = (
+        Index("ix_version_project_id", "project_id"),
+        Index("ix_version_parent_id", "parent_id"),
+    )
+
+    id: str = Field(
+        default_factory=lambda: str(uuid4()),
+        sa_column=Column(String(36), primary_key=True),
+    )
+
+    project_id: str = Field(
+        sa_column=Column(
+            String(36), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+        )
+    )
+    parent_id: Optional[str] = Field(
+        default=None,
+        sa_column=Column(
+            String(36), ForeignKey("version_history.id", ondelete="SET NULL"), nullable=True
+        ),
+    )
+    image_ids: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]")
+    )
+
+    prompt: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    
+    output_logs: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    
+    feedback: Optional[str] = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), server_default=func.now()),
+    )
+
+    project: "Project" = Relationship(
+        back_populates="versions",
+        sa_relationship_kwargs={
+            "foreign_keys": "[VersionHistory.project_id]"
+        }
+    )
+    
+
+    parent: Optional["VersionHistory"] = Relationship(
+        back_populates="children",
+        sa_relationship_kwargs={
+            "remote_side": "[VersionHistory.id]",
+        },
+    )
+    
+    children: List["VersionHistory"] = Relationship(
+        back_populates="parent",
+    )
+
+    def public_dict(self) -> dict:
+        return {
+            "id": str(self.id),
+            "project_id": str(self.project_id),
+            "parent_id": str(self.parent_id) if self.parent_id else None,
+            "image_ids": self.image_ids, 
+            "prompt": self.prompt,
+            "output_logs": self.output_logs,
+            "feedback": self.feedback,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
 class Project(SQLModel, table=True):
     __tablename__ = "project"
     __table_args__ = (
         Index("ix_project_user_id", "user_id"),
-        Index("ix_project_active_image_id", "active_image_id"),
+        Index("ix_project_current_version_id", "current_version_id"),
     )
 
     id: str = Field(
@@ -171,10 +247,10 @@ class Project(SQLModel, table=True):
         )
     )
 
-    active_image_id: Optional[str] = Field(
+    current_version_id: Optional[str] = Field(
         default=None,
         sa_column=Column(
-            String(36), ForeignKey("image.id", ondelete="SET NULL"), nullable=True
+            String(36), ForeignKey("version_history.id", ondelete="SET NULL"), nullable=True
         ),
     )
 
@@ -185,17 +261,17 @@ class Project(SQLModel, table=True):
 
     user: User = Relationship(back_populates="projects")
 
-    images: List["Image"] = Relationship(
+    versions: List["VersionHistory"] = Relationship(
         back_populates="project",
         sa_relationship_kwargs={
             "cascade": "all, delete-orphan",
-            "foreign_keys": "[Image.project_id]",
+            "foreign_keys": "[VersionHistory.project_id]",
         },
     )
 
-    active_image: Optional["Image"] = Relationship(
+    current_version: Optional["VersionHistory"] = Relationship(
         sa_relationship_kwargs={
-            "foreign_keys": "[Project.active_image_id]",
+            "foreign_keys": "[Project.current_version_id]",
             "post_update": True,
             "uselist": False,
         }
@@ -206,8 +282,8 @@ class Project(SQLModel, table=True):
             "id": str(self.id),
             "name": self.name,
             "user_id": str(self.user_id),
-            "active_image_id": str(self.active_image_id)
-            if self.active_image_id
+            "current_version_id": str(self.current_version_id)
+            if self.current_version_id
             else None,
             "created_at": self.created_at.isoformat(),
         }
@@ -216,9 +292,7 @@ class Project(SQLModel, table=True):
 class Image(SQLModel, table=True):
     __tablename__ = "image"
     __table_args__ = (
-        Index("ix_image_project_id", "project_id"),
         Index("ix_image_parent_image_id", "parent_image_id"),
-        Index("ix_image_selected_child_id", "selected_child_id"),
         Index("ix_image_sha256_hash", "sha256_hash"),
     )
 
@@ -227,6 +301,7 @@ class Image(SQLModel, table=True):
         sa_column=Column(String(36), primary_key=True),
     )
 
+    
     project_id: str = Field(
         sa_column=Column(
             String(36), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
@@ -234,13 +309,6 @@ class Image(SQLModel, table=True):
     )
 
     parent_image_id: Optional[str] = Field(
-        default=None,
-        sa_column=Column(
-            String(36), ForeignKey("image.id", ondelete="SET NULL"), nullable=True
-        ),
-    )
-
-    selected_child_id: Optional[str] = Field(
         default=None,
         sa_column=Column(
             String(36), ForeignKey("image.id", ondelete="SET NULL"), nullable=True
@@ -285,46 +353,27 @@ class Image(SQLModel, table=True):
         sa_column=Column(DateTime(timezone=True), server_default=func.now()),
     )
 
-    project: Project = Relationship(
-        back_populates="images",
-        sa_relationship_kwargs={"foreign_keys": "[Image.project_id]"},
-    )
 
-    parent: Optional["Image"] = Relationship(
-        back_populates="children",
+    parent_image: Optional["Image"] = Relationship(
+        back_populates="children_images",
         sa_relationship_kwargs={
             "remote_side": "[Image.id]",
-            "foreign_keys": "[Image.parent_image_id]",
-            "post_update": True,
-        },
-    )
-
-    children: List["Image"] = Relationship(
-        back_populates="parent",
-        sa_relationship_kwargs={
             "foreign_keys": "[Image.parent_image_id]",
         },
     )
 
-    selected_child: Optional["Image"] = Relationship(
+    children_images: List["Image"] = Relationship(
+        back_populates="parent_image",
         sa_relationship_kwargs={
-            "foreign_keys": "[Image.selected_child_id]",
-            "remote_side": "[Image.id]",
-            "post_update": True,
-            "uselist": False,
-        }
+            "foreign_keys": "[Image.parent_image_id]",
+        },
     )
 
     def public_dict(self) -> dict:
         return {
             "id": str(self.id),
             "project_id": str(self.project_id),
-            "parent_image_id": str(self.parent_image_id)
-            if self.parent_image_id
-            else None,
-            "selected_child_id": str(self.selected_child_id)
-            if self.selected_child_id
-            else None,
+            "parent_image_id": str(self.parent_image_id) if self.parent_image_id else None,
             "action_type": self.action_type.value
             if isinstance(self.action_type, ImageActionType)
             else self.action_type,
