@@ -411,6 +411,103 @@ async def delete_project(
     await session.commit()
     return {"message": "Project and all history deleted successfully"}
 
+# --- NEW APIS ---
+
+@image_router.get(
+    "/projects/{project_id}/versions",
+    status_code=200,
+    summary="Get all versions of a project",
+    description="Returns a list of all history versions for a project, ordered by creation date (newest first)."
+)
+async def get_project_versions(
+    project_id: str,
+    token_payload: Dict = Depends(verify_firebase_token),
+    session: AsyncSession = Depends(async_session),
+):
+    uploader = await upsert_user_from_token(token_payload, session)
+    
+    # 1. Verify Project Ownership
+    project = await session.get(Project, project_id)
+    if not project or project.user_id != uploader.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    # 2. Query versions
+    statement = (
+        select(VersionHistory)
+        .where(VersionHistory.project_id == project_id)
+        .order_by(desc(VersionHistory.created_at))
+    )
+    versions = (await session.execute(statement)).scalars().all()
+
+    # 3. Return metadata (images are not loaded here for performance, usually fetched individually)
+    return [v.public_dict() for v in versions]
+
+
+@image_router.get(
+    "/versions/{version_id}/images",
+    status_code=200,
+    summary="Get all images of a version",
+    description="Returns the full list of image objects (with presigned URLs) for a specific version state."
+)
+async def get_version_images(
+    version_id: str,
+    token_payload: Dict = Depends(verify_firebase_token),
+    session: AsyncSession = Depends(async_session),
+):
+    uploader = await upsert_user_from_token(token_payload, session)
+
+    # 1. Get Version
+    version = await session.get(VersionHistory, version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    # 2. Verify Ownership via Project
+    project = await session.get(Project, version.project_id)
+    if not project or project.user_id != uploader.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    # 3. Fetch Images using the JSON ID list
+    full_images = await _fetch_images_by_ids(session, version.image_ids)
+
+    # 4. Format Response
+    image_list = []
+    for img in full_images:
+        d = img.public_dict()
+        d["presigned_url"] = _s3_presign_sync(img.object_key)
+        image_list.append(d)
+
+    return image_list
+
+
+@image_router.get(
+    "/images/{image_id}",
+    status_code=200,
+    summary="Get image details",
+    description="Returns the metadata and presigned URL for a specific image asset."
+)
+async def get_image_details(
+    image_id: str,
+    token_payload: Dict = Depends(verify_firebase_token),
+    session: AsyncSession = Depends(async_session),
+):
+    uploader = await upsert_user_from_token(token_payload, session)
+
+    # 1. Get Image
+    image = await session.get(Image, image_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    # 2. Verify Ownership via Project
+    project = await session.get(Project, image.project_id)
+    if not project or project.user_id != uploader.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    # 3. Format Response
+    resp = image.public_dict()
+    resp["presigned_url"] = _s3_presign_sync(image.object_key)
+    
+    return resp
+
 
 @image_router.get("/", summary="Root endpoint", response_model=dict)
 async def root():
