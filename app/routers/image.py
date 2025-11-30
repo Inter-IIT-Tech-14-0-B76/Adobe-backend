@@ -411,7 +411,6 @@ async def delete_project(
     await session.commit()
     return {"message": "Project and all history deleted successfully"}
 
-# --- NEW APIS ---
 
 @image_router.get(
     "/projects/{project_id}/versions",
@@ -425,21 +424,15 @@ async def get_project_versions(
     session: AsyncSession = Depends(async_session),
 ):
     uploader = await upsert_user_from_token(token_payload, session)
-    
-    # 1. Verify Project Ownership
     project = await session.get(Project, project_id)
     if not project or project.user_id != uploader.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
-
-    # 2. Query versions
     statement = (
         select(VersionHistory)
         .where(VersionHistory.project_id == project_id)
         .order_by(desc(VersionHistory.created_at))
     )
-    versions = (await session.execute(statement)).scalars().all()
-
-    # 3. Return metadata (images are not loaded here for performance, usually fetched individually)
+    versions = (await session.exec(statement)).all()
     return [v.public_dict() for v in versions]
 
 
@@ -455,21 +448,14 @@ async def get_version_images(
     session: AsyncSession = Depends(async_session),
 ):
     uploader = await upsert_user_from_token(token_payload, session)
-
-    # 1. Get Version
     version = await session.get(VersionHistory, version_id)
     if not version:
         raise HTTPException(status_code=404, detail="Version not found")
-
-    # 2. Verify Ownership via Project
     project = await session.get(Project, version.project_id)
     if not project or project.user_id != uploader.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # 3. Fetch Images using the JSON ID list
     full_images = await _fetch_images_by_ids(session, version.image_ids)
-
-    # 4. Format Response
     image_list = []
     for img in full_images:
         d = img.public_dict()
@@ -491,23 +477,43 @@ async def get_image_details(
     session: AsyncSession = Depends(async_session),
 ):
     uploader = await upsert_user_from_token(token_payload, session)
-
-    # 1. Get Image
     image = await session.get(Image, image_id)
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
-
-    # 2. Verify Ownership via Project
     project = await session.get(Project, image.project_id)
     if not project or project.user_id != uploader.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # 3. Format Response
     resp = image.public_dict()
     resp["presigned_url"] = _s3_presign_sync(image.object_key)
     
     return resp
 
+@image_router.get(
+    "/users/{user_id}/projects",
+    status_code=200,
+    summary="List projects for a specific user",
+    description="Returns a list of all projects belonging to the specified user ID. Enforces security so users can only view their own projects."
+)
+async def list_projects_by_user(
+    user_id: str,
+    token_payload: Dict = Depends(verify_firebase_token),
+    session: AsyncSession = Depends(async_session),
+):
+    requester = await upsert_user_from_token(token_payload, session)
+    if not requester:
+        raise HTTPException(status_code=401, detail="User invalid")
+    if requester.id != user_id:
+        raise HTTPException(status_code=403, detail="Unauthorized to view projects for this user")
+
+    statement = (
+        select(Project)
+        .where(Project.user_id == user_id)
+        .order_by(desc(Project.created_at))
+    )
+    projects = (await session.exec(statement)).all()
+
+    return [p.public_dict() for p in projects]
 
 @image_router.get("/", summary="Root endpoint", response_model=dict)
 async def root():
