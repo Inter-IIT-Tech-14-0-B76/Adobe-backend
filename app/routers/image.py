@@ -511,7 +511,9 @@ async def list_projects_by_user(
         .where(Project.user_id == user_id)
         .order_by(desc(Project.created_at))
     )
-    projects = (await session.exec(statement)).all()
+
+    result = await session.execute(statement)
+    projects = result.scalars().all()
 
     return [p.public_dict() for p in projects]
 
