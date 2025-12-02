@@ -25,7 +25,7 @@ import time
 router = APIRouter(prefix="/api/style-transfer", tags=["Style Transfer"])
 
 
-WORKSPACE_DIR = Path(__file__).parent.parent.parent / "workspace"
+WORKSPACE_DIR = Path("/workspace/AIP/workspace")
 OUTPUTS_DIR = WORKSPACE_DIR / "outputs"
 
 
