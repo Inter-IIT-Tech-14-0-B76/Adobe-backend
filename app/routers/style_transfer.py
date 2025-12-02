@@ -246,21 +246,23 @@ async def style_transfer_with_reference(
 
 from fastapi.responses import FileResponse
 
-@router.get("/get-style-image")
-async def get_style_image():
+@router.get("/get-style-image/{filename}")
+async def get_style_image(filename: str):
     """
-    Get the generated style image.
+    Get a generated style image by filename.
     
+    Args:
+        filename: The name of the style image file to retrieve
+        
     Returns:
-        The style image file if found, or 404 if not found
+        The image file if found, or 404 if not found
     """
-    filename = "style_transfer_text_generated_style_1764687934.png"
-    image_path = Path("/workspace/AIP/workspace/outputs/images") / filename
+    image_path = WORKSPACE_DIR / "outputs" / "images" / filename
     
     if not image_path.exists():
         raise HTTPException(
             status_code=404,
-            detail=f"Style image not found at {image_path}"
+            detail=f"Image {filename} not found"
         )
     
     return FileResponse(
@@ -268,5 +270,4 @@ async def get_style_image():
         media_type="image/png",
         filename=filename
     )
-    
         
