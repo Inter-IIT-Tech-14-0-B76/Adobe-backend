@@ -244,3 +244,29 @@ async def style_transfer_with_reference(
         if temp_dir and temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+from fastapi.responses import FileResponse
+
+@router.get("/get-style-image")
+async def get_style_image():
+    """
+    Get the generated style image.
+    
+    Returns:
+        The style image file if found, or 404 if not found
+    """
+    filename = "style_transfer_text_generated_style_1764687934.png"
+    image_path = Path("/workspace/AIP/workspace/outputs/images") / filename
+    
+    if not image_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Style image not found at {image_path}"
+        )
+    
+    return FileResponse(
+        image_path,
+        media_type="image/png",
+        filename=filename
+    )
+    
+        
