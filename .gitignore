@@ -51,6 +51,7 @@ Thumbs.db
 ## Python
 env
 .env
+.venv_style_transfer
 service-account.json 
 bigquery-service-account.json
 __pycache__/
