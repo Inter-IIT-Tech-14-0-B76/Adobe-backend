@@ -24,7 +24,7 @@ router = APIRouter(prefix="/api/style-transfer", tags=["Style Transfer"])
 
 WORKSPACE_DIR = Path("/workspace/AIP/workspace")
 OUTPUTS_DIR = WORKSPACE_DIR / "outputs"
-VENV_DIR = Path("/workspace/API/.venv")
+VENV_DIR = Path("/workspace/AIP/.venv")
 
 if os.name == "nt":
     PYTHON_EXEC = VENV_DIR / "Scripts" / "python.exe"
