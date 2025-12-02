@@ -1,9 +1,0 @@
-torch
-diffusers
-transformers
-accelerate
-rembg
-Pillow
-opencv-python
-numpy
-onnxruntime[GPU]

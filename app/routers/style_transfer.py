@@ -104,14 +104,10 @@ async def ensure_task_environment(task_key: str) -> Path:
                 error_msg = stderr.decode() if stderr else "Unknown error"
                 raise RuntimeError(f"Failed to create venv: {error_msg}")
             
-            print("✓ Virtual environment created")
             
         except Exception as e:
             raise RuntimeError(f"Failed to create virtual environment: {str(e)}")
-    else:
-        print(f"✓ Virtual environment already exists at: {venv_dir}")
     
-    print("\nUpgrading pip, wheel, setuptools...")
     try:
         process = await asyncio.create_subprocess_exec(
             str(python_exe),
@@ -122,14 +118,11 @@ async def ensure_task_environment(task_key: str) -> Path:
         )
         
         await process.communicate()
-        print("✓ Core packages upgraded")
         
     except Exception as e:
-        print(f"⚠️  Warning: Failed to upgrade pip: {str(e)}")
+        print(f"  Warning: Failed to upgrade pip: {str(e)}")
     
     if requirements_file.exists():
-        print(f"\nInstalling requirements from: {requirements_file}")
-        
         try:
             process = await asyncio.create_subprocess_exec(
                 str(pip_exe),
@@ -142,16 +135,14 @@ async def ensure_task_environment(task_key: str) -> Path:
             
             if process.returncode != 0:
                 error_msg = stderr.decode() if stderr else "Unknown error"
-                print(f"⚠️  Warning during requirements installation: {error_msg}")
+                print(f"  Warning during requirements installation: {error_msg}")
             else:
-                print("✓ Requirements installed successfully")
+                print("Requirements installed successfully")
                 
         except Exception as e:
-            print(f"⚠️  Warning: Failed to install requirements: {str(e)}")
+            print(f"Warning: Failed to install requirements: {str(e)}")
     else:
-        print(f"⚠️  Warning: Requirements file not found: {requirements_file}")
-    
-    print(f"{'='*70}\n")
+        print(f"Warning: Requirements file not found: {requirements_file}")
     
     return python_exe
 
