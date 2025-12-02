@@ -77,7 +77,6 @@ def _comfy_workflow_worker(
     """
     tmp_path = None
     try:
-        # Create temporary file with appropriate extension
         _, ext = os.path.splitext(upload_filename)
         with tempfile.NamedTemporaryFile(
             prefix="comfy_upload_",
@@ -88,20 +87,17 @@ def _comfy_workflow_worker(
             tf.write(image_bytes)
             tf.flush()
 
-        # Upload to ComfyUI
         upload_info = upload_image_to_comfy(tmp_path)
         image_name = upload_info.get("name")
         if not image_name:
             raise ComfyError(f"ComfyUI upload response missing 'name': {upload_info}")
 
-        # Load and configure workflow
         workflow = load_workflow_template(workspace_name)
         inject_image_filename(workflow, [image_name])
 
         if prompt_text:
             inject_prompt_text(workflow, prompt_text)
 
-        # Execute workflow
         prompt_id = queue_prompt(workflow)
         images = wait_for_images(prompt_id, timeout_seconds=timeout_seconds)
 
@@ -113,7 +109,6 @@ def _comfy_workflow_worker(
         return images[0]
 
     finally:
-        # Clean up temporary file
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -149,13 +144,11 @@ async def run_cv_pipeline(
     3. Storing result back to S3
     4. Creating new Image record linked to original
     """
-    # Get and validate project/image
     print(f"input params: {project_id}, {token_payload}, {session}")
     uploader, active_image, project = await get_image(
         project_id, token_payload, session
     )
 
-    # Download source image from S3
     try:
         image_bytes: bytes = await anyio.to_thread.run_sync(
             _s3_get_object_bytes_sync, active_image.object_key
@@ -165,10 +158,8 @@ async def run_cv_pipeline(
             status_code=500, detail=f"Failed to download image from S3: {e}"
         )
 
-    # Prepare workflow parameters
     original_name = active_image.file_name or "input.png"
     selected_framework = choose_framework(framework)
-    # selected_workspace = choose_workspace(selected_framework, workspace)
     selected_workspace = "check"
     effective_prompt = prompt or ""
 
@@ -177,7 +168,6 @@ async def run_cv_pipeline(
             status_code=400, detail=f"Unsupported framework: {selected_framework}"
         )
 
-    # Run ComfyUI workflow in thread pool
     try:
         result_bytes: bytes = await anyio.to_thread.run_sync(
             _comfy_workflow_worker,
@@ -196,7 +186,6 @@ async def run_cv_pipeline(
             status_code=500, detail=f"Unexpected error processing image: {e}"
         )
 
-    # Store result to S3
     sha256_hash = _compute_sha256(result_bytes)
     result_filename = f"cv_{uuid4().hex}.png"
     object_key_out = f"project/{project_id}/{sha256_hash}/{result_filename}"
@@ -210,7 +199,6 @@ async def run_cv_pipeline(
             status_code=500, detail=f"Failed to upload processed image to S3: {e}"
         )
 
-    # Create new Image record
     gen_params: Dict[str, Any] = {
         "framework": selected_framework,
         "workspace": selected_workspace,
@@ -234,14 +222,12 @@ async def run_cv_pipeline(
     session.add(new_image)
     await session.flush()
 
-    # Update project's active image
     project.active_image_id = new_image.id
     session.add(project)
 
     await session.commit()
     await session.refresh(new_image)
 
-    # Build response
     resp = new_image.public_dict()
     resp["project_id"] = str(project.id)
     resp["presigned_url"] = _s3_presign_sync(new_image.object_key)

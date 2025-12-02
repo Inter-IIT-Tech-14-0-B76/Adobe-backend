@@ -1,11 +1,6 @@
 """
-Style Transfer API Router (Refactored)
+Style Transfer API Router
 Provides endpoints for AI-powered style transfer operations.
-Located at: app/routers/style_transfer.py
-
-Assumptions:
-- The virtual environment is already created at: /workspace/AIP/workspace/.venv_style_transfer
-- All requirements are installed.
 """
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -67,7 +62,6 @@ async def run_style_transfer_pipeline(
 ) -> dict:
     """
     Constructs the command and runs the style transfer script via subprocess.
-    Assumes environment dependencies are already satisfied.
     """
     output_dir_images = OUTPUTS_DIR / "images"
     output_dir_data = OUTPUTS_DIR / "data"

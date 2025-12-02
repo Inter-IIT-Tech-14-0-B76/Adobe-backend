@@ -28,9 +28,6 @@ async def decide_workspace(
 ) -> Dict[str, Any]:
     """
     Determine the most appropriate workspace based on the user's request.
-    
-    This endpoint uses an LLM to analyze the user's request and determine
-    which workspace would be most appropriate for the task.
     """
     try:
         user = await upsert_user_from_token(token_payload, session, set_last_login=False)

@@ -83,7 +83,6 @@ def _traverse_and_set(
     parts = field_path.split(".")
     cur = root
 
-    # Traverse to the parent of the target
     for i, seg in enumerate(parts[:-1]):
         if isinstance(cur, dict):
             if seg not in cur:
@@ -102,7 +101,6 @@ def _traverse_and_set(
                 f"while traversing '{field_path}': {type(cur).__name__}"
             )
 
-    # Set the final value
     final_key = parts[-1]
     if isinstance(cur, dict):
         cur[final_key] = value
@@ -169,7 +167,6 @@ def inject_prompt_text(
     nodes_root = workflow.get("workflow", {})
     text_fields = workflow.get("text_input_fields", [])
 
-    # If text_input_fields is defined, use it
     if text_fields:
         for field_path in text_fields:
             _traverse_and_set(nodes_root, field_path, prompt_text)
@@ -204,7 +201,6 @@ def queue_prompt(
     url = f"{COMFY_URL}/prompt"
     client_id = client_id or uuid.uuid4().hex
 
-    # Extract the actual node graph from our wrapper structure
     prompt_data = workflow.get("workflow", workflow)
 
     payload = {
@@ -217,7 +213,6 @@ def queue_prompt(
         resp.raise_for_status()
         data = resp.json()
     except requests.exceptions.HTTPError as e:
-        # Try to get error details from response
         error_detail = ""
         try:
             error_json = e.response.json()
@@ -294,7 +289,6 @@ def wait_for_images(
 
         prompt_data = history[prompt_id]
 
-        # Check for execution errors
         status_data = prompt_data.get("status", {})
         if status_data.get("status_str") == "error":
             messages = status_data.get("messages", [])
@@ -358,10 +352,8 @@ def process_image_with_comfy(
     workspace_name = workspace_name or DEFAULT_WORKSPACE
     workflow = load_workflow_template(workspace_name)
 
-    # Inject the uploaded filename (expects a list)
     inject_image_filename(workflow, [image_name])
 
-    # Inject prompt if provided
     if prompt_text:
         inject_prompt_text(workflow, prompt_text)
 

@@ -18,16 +18,13 @@ engine_kwargs = {
     "pool_pre_ping": ENV != "dev",
 }
 
-# SQLite-specific connect_args
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs.update({"connect_args": {"check_same_thread": False}})
 
 engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 
-# Log resolved DB URL
 logger.info("DATABASE_URL resolved to: %s", str(engine.url))
 
-# Enable foreign key support for SQLite
 if DATABASE_URL.startswith("sqlite"):
 
     @event.listens_for(engine.sync_engine, "connect")
@@ -40,7 +37,6 @@ if DATABASE_URL.startswith("sqlite"):
             logger.exception("Could not enable SQLite foreign keys PRAGMA")
 
 
-# Async session factory
 AsyncSessionLocal = sessionmaker(
     bind=engine,
     class_=AsyncSession,
@@ -71,7 +67,6 @@ async def async_session() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """
     Initialize database tables (for dev / first deployment).
-    In real production, use Alembic migrations instead of this.
     """
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
