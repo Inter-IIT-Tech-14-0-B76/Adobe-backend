@@ -65,13 +65,13 @@ async def _fetch_images_by_ids(session: AsyncSession, image_ids: List[str]) -> L
     "/images/upload",
     status_code=201,
     summary="Start Project & Upload Root",
-    description="Creates a project and the first version containing this single image."
+    description="Creates a project and the first version containing one or more images."
 )
 async def upload_physical_image(
     token_payload: Dict = Depends(verify_firebase_token),
     project_id: Optional[str] = Form(None), 
     parent_version_id: Optional[str] = Form(None),
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
     action_type: ImageActionType = Form(ImageActionType.UPLOAD),
     prompt: Optional[str] = Form(None),
     generation_params_str: Optional[str] = Form(None),
@@ -81,8 +81,9 @@ async def upload_physical_image(
     if not uploader:
         raise HTTPException(status_code=401, detail="User invalid")
 
-    contents = await file.read()
-    sha256_hash = _compute_sha256(contents)
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+
     gen_params = json.loads(generation_params_str) if generation_params_str else {}
 
     if project_id:
@@ -93,39 +94,48 @@ async def upload_physical_image(
         project = Project(
             id=str(uuid4()),
             user_id=uploader.id,
-            name=file.filename or "Untitled Project",
+            name=files[0].filename or "Untitled Project",
         )
         session.add(project)
         await session.flush() 
 
-    object_key = f"project/{project.id}/assets/{sha256_hash}/{file.filename or 'image'}"
-    
-    await anyio.to_thread.run_sync(
-        _s3_put_object_sync, object_key, contents, file.content_type
-    )
+    new_images = []
+    image_ids = []
 
-    new_image = Image(
-        id=str(uuid4()),
-        project_id=project.id,
-        object_key=object_key,
-        file_name=file.filename,
-        mime_type=file.content_type,
-        sha256_hash=sha256_hash,
-        action_type=action_type,
-        is_virtual=False,
-        transformations={},
-        generation_params=gen_params,
-    )
-    session.add(new_image)
+    for file in files:
+        contents = await file.read()
+        sha256_hash = _compute_sha256(contents)
+        object_key = f"project/{project.id}/assets/{sha256_hash}/{file.filename or 'image'}"
+        
+        await anyio.to_thread.run_sync(
+            _s3_put_object_sync, object_key, contents, file.content_type
+        )
+
+        new_image = Image(
+            id=str(uuid4()),
+            project_id=project.id,
+            object_key=object_key,
+            file_name=file.filename,
+            mime_type=file.content_type,
+            sha256_hash=sha256_hash,
+            action_type=action_type,
+            is_virtual=False,
+            transformations={},
+            generation_params=gen_params,
+        )
+        session.add(new_image)
+        new_images.append(new_image)
+        image_ids.append(new_image.id)
+
     await session.flush() 
 
     new_version = VersionHistory(
         id=str(uuid4()),
         project_id=project.id,
         parent_id=parent_version_id, 
-        image_ids=[new_image.id],
+        image_ids=image_ids,
         prompt=prompt,
-        output_logs="Initial upload",
+        output_logs=f"Initial upload of {len(files)} image(s)",
     )
     session.add(new_version)
     
@@ -138,8 +148,11 @@ async def upload_physical_image(
     await session.refresh(new_version)
 
     resp = new_version.public_dict()
-    resp["images"] = [new_image.public_dict()]
-    resp["images"][0]["presigned_url"] = _s3_presign_sync(new_image.object_key)
+    resp["images"] = []
+    for img in new_images:
+        img_dict = img.public_dict()
+        img_dict["presigned_url"] = _s3_presign_sync(img.object_key)
+        resp["images"].append(img_dict)
     return resp
 
 
