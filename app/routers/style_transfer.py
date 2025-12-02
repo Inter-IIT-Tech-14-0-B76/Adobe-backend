@@ -270,4 +270,17 @@ async def get_style_image(filename: str):
         media_type="image/png",
         filename=filename
     )
-        
+
+from fastapi.responses import Response
+from fastapi import status
+
+@router.post("/echo-image", response_class=Response, status_code=status.HTTP_200_OK)
+async def echo_image(
+    image: UploadFile = File(..., description="Image to be echoed back")
+):
+    contents = await image.read()
+    return Response(
+        content=contents,
+        media_type=image.content_type,
+        headers={"Content-Disposition": f"inline; filename={image.filename}"}
+    )
