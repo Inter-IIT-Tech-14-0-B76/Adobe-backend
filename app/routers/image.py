@@ -252,7 +252,7 @@ async def create_virtual_edit(
     if not parent_version.image_ids:
         raise HTTPException(status_code=400, detail="The selected version contains no images to edit")
     
-    source_image_id = parent_version.image_ids[0]
+    source_image_id = parent_version.image_ids[-1]
 
     # 3. Fetch that source image details
     source_image = await session.get(Image, source_image_id)
