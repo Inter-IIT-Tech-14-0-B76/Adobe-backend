@@ -34,15 +34,12 @@ async def _delete_future_versions(session: AsyncSession, parent_id: str):
     Recursively finds and deletes all child versions (the future history)
     originating from the given parent_id.
     """
-    # Find immediate children of this version
     statement = select(VersionHistory).where(VersionHistory.parent_id == parent_id)
     result = await session.execute(statement)
     children = result.scalars().all()
 
     for child in children:
-        # Recursively delete the sub-children of this child first
         await _delete_future_versions(session, child.id)
-        # Then delete the child itself
         await session.delete(child)
 
 image_router = APIRouter(tags=["Images and Versions"])
@@ -243,27 +240,20 @@ async def create_virtual_edit(
     if not project or project.user_id != uploader.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # 1. Fetch the version specified by the user
     parent_version = await session.get(VersionHistory, version_id)
     if not parent_version:
         raise HTTPException(status_code=404, detail="Version not found")
-
-    # 2. Pick the first image from the version's image list
     if not parent_version.image_ids:
         raise HTTPException(status_code=400, detail="The selected version contains no images to edit")
     
     source_image_id = parent_version.image_ids[-1]
 
-    # 3. Fetch that source image details
     source_image = await session.get(Image, source_image_id)
     if not source_image:
         raise HTTPException(status_code=404, detail="Source image asset missing")
 
-    # 4. DESTRUCTIVE STEP: Delete all existing children (future history) of this version
-    #    This ensures we are rewriting history from this point forward.
     await _delete_future_versions(session, version_id)
 
-    # 5. Create the new Virtual Image
     new_edited_image = Image(
         id=str(uuid4()),
         project_id=project_id,
@@ -279,13 +269,11 @@ async def create_virtual_edit(
     session.add(new_edited_image)
     await session.flush() 
 
-    # 6. Construct new ID list
     new_image_ids = [
         uid if uid != source_image_id else new_edited_image.id 
         for uid in parent_version.image_ids
     ]
 
-    # 7. Create New Version pointing to the new state
     new_version = VersionHistory(
         id=str(uuid4()),
         project_id=project_id,
@@ -298,7 +286,6 @@ async def create_virtual_edit(
     
     await session.flush() 
     
-    # Update project current pointer to this new head
     project.current_version_id = new_version.id
     session.add(project)
     
