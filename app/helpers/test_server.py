@@ -534,7 +534,7 @@ def execute_tool(tool, image_path, prompt, params, ai_suggestions):
     tool_endpoints = {
         "style-transfer-text": "/style-transfer/text",
         "style-transfer-ref": "/style-transfer/ref",
-        "color-grading": "/color-grading",
+        "color_grading": "/color-grading",
         "segmentation": "/sam/segment",
     }
 
