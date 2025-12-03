@@ -21,6 +21,117 @@ DEFAULT_CONTENT_IMAGE = "/workspace/AIP/workspace/outputs/images/main.png"
 DEFAULT_STYLE_IMAGE = "/workspace/AIP/workspace/outputs/images/reference.png"
 
 
+def _determine_image_roles_local(user_prompt: str, num_images: int) -> Dict[str, Any]:
+    """
+    Local helper to determine which image is style/reference and which is content.
+    Used when the server's /classify endpoint doesn't support num_images parameter.
+    """
+    prompt_lower = user_prompt.lower()
+
+    # Default: first image is style, second is content
+    style_index = 0
+    content_index = 1
+    confidence = "low"
+
+    # Patterns where first image is style reference
+    first_is_style_patterns = [
+        "style of first",
+        "first image style",
+        "style from first",
+        "like the first",
+        "first image's style",
+        "copy first",
+        "transfer from first",
+        "first one's style",
+        "style of image 1",
+        "image 1 style",
+        "style from image 1",
+    ]
+
+    # Patterns where second image is style reference
+    second_is_style_patterns = [
+        "style of second",
+        "second image style",
+        "style from second",
+        "like the second",
+        "second image's style",
+        "copy second",
+        "transfer from second",
+        "second one's style",
+        "style of image 2",
+        "image 2 style",
+        "style from image 2",
+        "starry night",  # specific case: Van Gogh's painting is likely the style reference
+    ]
+
+    # Patterns where first is content (to be styled)
+    first_is_content_patterns = [
+        "apply to first",
+        "first image to",
+        "style the first",
+        "edit first",
+        "transform first",
+        "first one to",
+        "apply to image 1",
+        "image 1 to",
+        "to the couple",
+        "to the person",
+        "to the photo",  # content is often described by subject
+    ]
+
+    # Patterns where second is content (to be styled)
+    second_is_content_patterns = [
+        "apply to second",
+        "second image to",
+        "style the second",
+        "edit second",
+        "transform second",
+        "second one to",
+        "apply to image 2",
+        "image 2 to",
+    ]
+
+    for pattern in first_is_style_patterns:
+        if pattern in prompt_lower:
+            style_index = 0
+            content_index = 1
+            confidence = "high"
+            break
+
+    for pattern in second_is_style_patterns:
+        if pattern in prompt_lower:
+            style_index = 1
+            content_index = 0
+            confidence = "high"
+            break
+
+    for pattern in first_is_content_patterns:
+        if pattern in prompt_lower:
+            content_index = 0
+            style_index = 1
+            confidence = "high"
+            break
+
+    for pattern in second_is_content_patterns:
+        if pattern in prompt_lower:
+            content_index = 1
+            style_index = 0
+            confidence = "high"
+            break
+
+    # Ensure indices are within bounds
+    if style_index >= num_images:
+        style_index = 0
+    if content_index >= num_images:
+        content_index = num_images - 1
+
+    return {
+        "style_index": style_index,
+        "content_index": content_index,
+        "confidence": confidence,
+    }
+
+
 def debug_print(message: str, level: str = "INFO"):
     """Print debug messages with formatting."""
     if DEBUG:
@@ -507,6 +618,33 @@ def run_ai_editing_pipeline(
 
         # Extract image_roles if present (for style_transfer_ref)
         image_roles = classification_data.get("image_roles")
+
+        # Local override: detect style_transfer_ref when server doesn't support num_images
+        # Check if we have multiple images and the prompt suggests style transfer between them
+        if num_images >= 2 and not image_roles:
+            prompt_lower = user_prompt.lower()
+            style_ref_keywords = [
+                "copy style",
+                "match style",
+                "like this image",
+                "transfer style",
+                "style from",
+                "same style as",
+                "style of the",
+                "apply the style",
+                "reference image",
+                "style reference",
+                "transfer the style",
+                "style to",
+                "make it look like",
+            ]
+            if any(kw in prompt_lower for kw in style_ref_keywords):
+                debug_print(
+                    "Local override: Detected style_transfer_ref scenario", "INFO"
+                )
+                classification = "style_transfer_ref"
+                # Determine image roles from prompt
+                image_roles = _determine_image_roles_local(user_prompt, num_images)
 
         tool = classification.strip().lower() if isinstance(classification, str) else ""
         params = {}
