@@ -439,13 +439,11 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
         )
 
         # Handle different response formats
-        if isinstance(classification_data, dict):
-            if "classification" in classification_data:
-                classification = classification_data.get("classification", {})
-            else:
-                classification = classification_data
+        if "classification" in classification_data:
+            classification = classification_data.get("classification", {})
         else:
-            classification = "style-transfer-text"
+            print("[WARN]: Classification not found in ")
+            classification = classification_data
 
         tool = (
             classification.strip().lower()
