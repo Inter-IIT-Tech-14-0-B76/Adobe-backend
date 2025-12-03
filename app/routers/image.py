@@ -246,6 +246,12 @@ async def create_virtual_edit(
     version_id: str = Body(..., description="The ID of the version to edit"),
     transformations: Dict = Body(...),
     prompt: Optional[str] = Body(None),
+    from_ai_screen: bool = Body(
+        False
+    ),
+    edited_file: Optional[UploadFile] = File(
+        None
+    ),
     session: AsyncSession = Depends(async_session),
 ):
     uploader = await upsert_user_from_token(token_payload, session, set_last_login=True)
@@ -267,18 +273,53 @@ async def create_virtual_edit(
 
     await _delete_future_versions(session, version_id)
 
-    new_edited_image = Image(
-        id=str(uuid4()),
-        project_id=project_id,
-        parent_image_id=source_image.id, 
-        object_key=source_image.object_key, 
-        file_name=source_image.file_name,
-        mime_type=source_image.mime_type,
-        sha256_hash=source_image.sha256_hash,
-        transformations=transformations, 
-        action_type=ImageActionType.EDIT,
-        is_virtual=True,
-    )
+    # If the edit comes from the AI screen, we persist the fully edited image
+    # as a new physical asset in S3 so downstream consumers can treat it as a
+    # normal (non-virtual) image. Otherwise, we keep the previous behavior of
+    # storing a virtual edit that reuses the same underlying S3 object.
+    if from_ai_screen:
+        if not edited_file:
+            raise HTTPException(
+                status_code=400,
+                detail="edited_file is required when from_ai_screen is true",
+            )
+
+        contents = await edited_file.read()
+        sha256_hash = _compute_sha256(contents)
+        object_key = (
+            f"project/{project_id}/assets/{sha256_hash}/"
+            f"{edited_file.filename or 'image'}"
+        )
+
+        await anyio.to_thread.run_sync(
+            _s3_put_object_sync, object_key, contents, edited_file.content_type
+        )
+
+        new_edited_image = Image(
+            id=str(uuid4()),
+            project_id=project_id,
+            parent_image_id=source_image.id,
+            object_key=object_key,
+            file_name=edited_file.filename,
+            mime_type=edited_file.content_type,
+            sha256_hash=sha256_hash,
+            transformations=transformations,
+            action_type=ImageActionType.EDIT,
+            is_virtual=False,
+        )
+    else:
+        new_edited_image = Image(
+            id=str(uuid4()),
+            project_id=project_id,
+            parent_image_id=source_image.id,
+            object_key=source_image.object_key,
+            file_name=source_image.file_name,
+            mime_type=source_image.mime_type,
+            sha256_hash=source_image.sha256_hash,
+            transformations=transformations,
+            action_type=ImageActionType.EDIT,
+            is_virtual=True,
+        )
     session.add(new_edited_image)
     await session.flush() 
 
