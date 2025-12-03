@@ -445,7 +445,6 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
             print("[WARN]: Classification not found in ")
             classification = classification_data
 
-        print("[INFOO]: classification", classification)
         tool = (
             classification.strip().lower()
         )  # .get('tool') or classification.get('classification', 'unknown')
@@ -460,7 +459,7 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
         # elif tool == 'color-grading':
 
         # elif tool ==  'segmentation':
-        if tool == "default_mode" or "style-transfer":
+        if tool == "default_mode" or tool == "style-transfer":
             tool = "style-transfer-text"
         if tool == "color_grading":
             tool = "color-grading"
