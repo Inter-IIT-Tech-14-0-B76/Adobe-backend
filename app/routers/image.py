@@ -20,6 +20,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.helpers.auth import upsert_user_from_token, verify_firebase_token
 from app.helpers.s3 import (
     _compute_sha256,
+    _s3_get_object_bytes_sync,
     _s3_presign_sync,
     _s3_put_object_sync,
 )
@@ -270,6 +271,166 @@ async def upload_physical_image(
             img_dict["presigned_url"] = _s3_presign_sync(img.object_key)
             resp["images"].append(img_dict)
         return resp
+
+
+@image_router.post(
+    "/projects/{project_id}/prompt",
+    status_code=201,
+    summary="Process image with AI prompt",
+    description="Takes the latest image from the current version, runs AI pipeline with the provided prompt, and creates a new version with the result."
+)
+async def process_with_prompt(
+    project_id: str,
+    token_payload: Dict = Depends(verify_firebase_token),
+    prompt: str = Body(..., embed=True, description="AI editing prompt"),
+    generation_params_str: Optional[str] = Body(None, embed=True),
+    session: AsyncSession = Depends(async_session),
+):
+    uploader = await upsert_user_from_token(token_payload, session, set_last_login=True)
+    if not uploader:
+        raise HTTPException(status_code=401, detail="User invalid")
+
+    project = await session.get(Project, project_id)
+    if not project or project.user_id != uploader.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    if not project.current_version_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Project has no current version. Please upload an image first."
+        )
+
+    current_version = await session.get(VersionHistory, project.current_version_id)
+    if not current_version:
+        raise HTTPException(status_code=404, detail="Current version not found")
+
+    if not current_version.image_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Current version has no images. Please upload an image first."
+        )
+
+    source_image_id = current_version.image_ids[-1]
+    source_image = await session.get(Image, source_image_id)
+    if not source_image:
+        raise HTTPException(status_code=404, detail="Source image not found")
+
+    if not source_image.object_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Source image has no S3 object key"
+        )
+
+    gen_params = json.loads(generation_params_str) if generation_params_str else {}
+
+    WORKSPACE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    local_input_path = WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{source_image.file_name or 'image'}"
+
+    try:
+        image_bytes = await anyio.to_thread.run_sync(
+            _s3_get_object_bytes_sync, source_image.object_key
+        )
+
+        def write_file():
+            local_input_path.write_bytes(image_bytes)
+        await anyio.to_thread.run_sync(write_file)
+
+        input_path = str(local_input_path)
+        pipeline_result = await anyio.to_thread.run_sync(
+            run_ai_editing_pipeline, input_path, prompt
+        )
+
+        if pipeline_result.get('error'):
+            raise HTTPException(
+                status_code=500,
+                detail=f"AI pipeline failed: {pipeline_result.get('error')}"
+            )
+
+        output_image_path = pipeline_result.get('output_image_path')
+        if not output_image_path or not Path(output_image_path).exists():
+            raise HTTPException(
+                status_code=500,
+                detail="AI pipeline did not produce output image"
+            )
+
+        def read_output():
+            return Path(output_image_path).read_bytes()
+        output_contents = await anyio.to_thread.run_sync(read_output)
+        output_sha256 = _compute_sha256(output_contents)
+        output_filename = Path(output_image_path).name
+        output_object_key = f"project/{project_id}/assets/{output_sha256}/{output_filename}"
+
+        await anyio.to_thread.run_sync(
+            _s3_put_object_sync,
+            output_object_key,
+            output_contents,
+            "image/png"
+        )
+
+        output_image = Image(
+            id=str(uuid4()),
+            project_id=project_id,
+            parent_image_id=source_image.id,
+            object_key=output_object_key,
+            file_name=output_filename,
+            mime_type="image/png",
+            sha256_hash=output_sha256,
+            action_type=ImageActionType.GENERATE,
+            is_virtual=False,
+            transformations={},
+            generation_params={
+                **gen_params,
+                "pipeline_result": pipeline_result,
+                "prompt": prompt,
+            },
+        )
+        session.add(output_image)
+        await session.flush()
+
+        new_version = VersionHistory(
+            id=str(uuid4()),
+            project_id=project_id,
+            parent_id=current_version.id,
+            image_ids=[output_image.id],
+            prompt=prompt,
+            output_logs=f"AI processed with prompt: {prompt}",
+        )
+        session.add(new_version)
+        await session.flush()
+
+        project.current_version_id = new_version.id
+        session.add(project)
+
+        if local_input_path.exists():
+            def delete_file():
+                local_input_path.unlink()
+            await anyio.to_thread.run_sync(delete_file)
+
+        await session.commit()
+        await session.refresh(new_version)
+
+        resp = new_version.public_dict()
+        resp["images"] = []
+        img_dict = output_image.public_dict()
+        img_dict["presigned_url"] = _s3_presign_sync(output_image.object_key)
+        resp["images"].append(img_dict)
+        return resp
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if local_input_path.exists():
+            try:
+                def delete_file():
+                    local_input_path.unlink()
+                await anyio.to_thread.run_sync(delete_file)
+            except Exception:
+                pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI pipeline error: {str(e)}"
+        )
 
 
 @image_router.post(
