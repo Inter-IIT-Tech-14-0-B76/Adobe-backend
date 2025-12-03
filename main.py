@@ -9,7 +9,6 @@ from app.routers.image import image_router
 from app.routers.user import user_router
 from app.routers.cv import router as cv_router
 from app.routers.workspace import workspace_router
-from app.routers.style_transfer import router as style_transfer_router
 from app.utils.db import init_db
 
 dotenv.load_dotenv()
@@ -51,4 +50,3 @@ app.include_router(image_router)
 app.include_router(user_router, prefix="/user")
 app.include_router(cv_router)
 app.include_router(workspace_router)
-app.include_router(style_transfer_router)

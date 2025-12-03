@@ -1,5 +1,5 @@
 """
-AI Editing Flow Test Script
+AI Editing Flow Helper Functions
 Implements the complete flow: Analyze -> Classify -> Execute Tool
 """
 
@@ -7,10 +7,10 @@ import requests
 import json
 import time
 import os
+from pathlib import Path
+from typing import Dict, Any, Optional
 
-WORKSPACE_SERVER = "http://localhost:8000"
-TEST_IMAGE = "/workspace/AIP/workspace/outputs/images/final_metric.png"
-OUTPUT_DIR = "/workspace/AIP/workspace/outputs/images"
+from config import WORKSPACE_SERVER, WORKSPACE_OUTPUT_DIR
 
 timings = {}
 
@@ -50,14 +50,17 @@ def check_status():
     return pretty_print(r)
 
 
-def ai_editing_flow(image_path, user_prompt):
-    print("\n" + "="*60)
-    print("STARTING AI EDITING FLOW")
-    print("="*60)
-    print(f"Image: {image_path}")
-    print(f"Prompt: {user_prompt}")
+def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]:
+    """
+    Run the complete AI editing pipeline: Analyze -> Classify -> Execute Tool.
     
-    print("\n[STEP 1/3] Analyzing image...")
+    Args:
+        image_path: Path to the input image file
+        user_prompt: User's editing prompt/request
+        
+    Returns:
+        Dict with 'error' key if failed, or result dict with output paths
+    """
     try:
         analyze_resp = requests.post(
             f"{WORKSPACE_SERVER}/ai-suggestions",
@@ -66,20 +69,14 @@ def ai_editing_flow(image_path, user_prompt):
         )
         
         if analyze_resp.status_code != 200:
-            print(f"Analysis failed: {analyze_resp.status_code}")
             return {"error": "Image analysis failed", "response": analyze_resp.text}
         
         analysis_data = analyze_resp.json()
-        print("Image analysis complete")
-        print(f"Suggestions: {json.dumps(analysis_data.get('suggestions', {}), indent=2)}")
-        
         ai_suggestions = analysis_data.get('suggestions', {})
         
     except Exception as e:
-        print(f"Analysis error: {e}")
-        return {"error": str(e)}
+        return {"error": f"Analysis error: {str(e)}"}
     
-    print("\n[STEP 2/3] Classifying task and extracting parameters...")
     try:
         classify_resp = requests.post(
             f"{WORKSPACE_SERVER}/classify",
@@ -91,25 +88,15 @@ def ai_editing_flow(image_path, user_prompt):
         )
         
         if classify_resp.status_code != 200:
-            print(f"Classification failed: {classify_resp.status_code}")
             return {"error": "Classification failed", "response": classify_resp.text}
         
         classification_data = classify_resp.json()
-        print("Classification complete")
-        print(f"Tool: {classification_data.get('classification', {})}")
-        
         classification = classification_data.get('classification', {})
         tool = classification.get('tool', 'unknown')
         params = classification.get('parameters', {})
         
-        print(f"\nSelected Tool: {tool}")
-        print(f"Parameters: {json.dumps(params, indent=2)}")
-        
     except Exception as e:
-        print(f"Classification error: {e}")
-        return {"error": str(e)}
-    
-    print(f"\n[STEP 3/3] Executing tool: {tool}...")
+        return {"error": f"Classification error: {str(e)}"}
     
     try:
         result = execute_tool(
@@ -121,20 +108,34 @@ def ai_editing_flow(image_path, user_prompt):
         )
         
         if result.get('error'):
-            print(f"Tool execution failed: {result['error']}")
             return result
         
+        return result
+        
+    except Exception as e:
+        return {"error": f"Tool execution error: {str(e)}"}
+
+
+def ai_editing_flow(image_path, user_prompt):
+    """Legacy test function - wraps run_ai_editing_pipeline with logging."""
+    print("\n" + "="*60)
+    print("STARTING AI EDITING FLOW")
+    print("="*60)
+    print(f"Image: {image_path}")
+    print(f"Prompt: {user_prompt}")
+    
+    result = run_ai_editing_pipeline(image_path, user_prompt)
+    
+    if result.get('error'):
+        print(f"Error: {result.get('error')}")
+    else:
         print("Tool execution complete")
         print(f"\n{'='*60}")
         print("FLOW COMPLETE")
         print('='*60)
         print(f"Output: {result.get('output', 'N/A')}")
-        
-        return result
-        
-    except Exception as e:
-        print(f"Tool execution error: {e}")
-        return {"error": str(e)}
+    
+    return result
 
 
 def execute_tool(tool, image_path, prompt, params, ai_suggestions):
@@ -152,9 +153,6 @@ def execute_tool(tool, image_path, prompt, params, ai_suggestions):
     
     payload = build_tool_payload(tool, image_path, prompt, params)
     
-    print(f"Calling endpoint: {endpoint}")
-    print(f"Payload: {json.dumps(payload, indent=2)}")
-    
     try:
         response = requests.post(
             f"{WORKSPACE_SERVER}{endpoint}",
@@ -168,19 +166,41 @@ def execute_tool(tool, image_path, prompt, params, ai_suggestions):
                 "response": response.text
             }
         
-        return response.json()
+        result = response.json()
+        
+        output_path = None
+        if tool == 'style-transfer-text':
+            output_paths = result.get('output_paths', {})
+            output_path = output_paths.get('composite') or output_paths.get('styled_only')
+        elif tool == 'style-transfer-ref':
+            output_paths = result.get('output_paths', {})
+            output_path = output_paths.get('composite') or output_paths.get('styled_only')
+        elif tool == 'color-grading':
+            output_paths = result.get('output_paths', {})
+            output_path = output_paths.get('output_image') or output_paths.get('composite')
+        elif tool == 'segmentation':
+            output_path = result.get('output_path') or result.get('mask_path')
+        
+        if output_path:
+            result['output_image_path'] = output_path
+        
+        return result
         
     except Exception as e:
         return {"error": f"Tool execution failed: {e}"}
 
 
-def build_tool_payload(tool, image_path, prompt, params):
+def build_tool_payload(tool, image_path, prompt, params, output_dir: Optional[str] = None):
+    """Build payload for tool execution."""
+    if output_dir is None:
+        output_dir = str(WORKSPACE_OUTPUT_DIR)
+    
     if tool == 'style-transfer-text':
         return {
             "content": image_path,
             "style_text": params.get('style_text', prompt),
             "prompt": prompt,
-            "output_dir": OUTPUT_DIR,
+            "output_dir": output_dir,
             "steps": params.get('steps', 50),
             "style_steps": params.get('style_steps', 25),
             "max_side": params.get('max_side', 1024),
@@ -192,7 +212,7 @@ def build_tool_payload(tool, image_path, prompt, params):
             "content": image_path,
             "style": params.get('style_image', ''),
             "prompt": prompt,
-            "output_dir": OUTPUT_DIR,
+            "output_dir": output_dir,
             "steps": params.get('steps', 50),
             "max_side": params.get('max_side', 1024),
             "negative_prompt": params.get('negative_prompt', '')
@@ -203,7 +223,7 @@ def build_tool_payload(tool, image_path, prompt, params):
             "image": image_path,
             "prompt": prompt,
             "mode": params.get('mode', 'both'),
-            "output_dir_images": OUTPUT_DIR,
+            "output_dir_images": output_dir,
             "output_dir_data": "/workspace/AIP/workspace/outputs/data"
         }
     
@@ -217,96 +237,6 @@ def build_tool_payload(tool, image_path, prompt, params):
     
     else:
         return {"image": image_path, "prompt": prompt}
-
-
-def test_style_transfer_text():
-    print("\n[TEST] Style Transfer (Text)")
-    r = requests.post(
-        f"{WORKSPACE_SERVER}/style-transfer/text",
-        json={
-            "content": TEST_IMAGE,
-            "style_text": "soft pastel art style with gentle tones",
-            "prompt": "apply a smooth dreamy pastel look",
-            "output_dir": OUTPUT_DIR,
-            "steps": 40,
-            "style_steps": 20
-        },
-        timeout=120
-    )
-    return pretty_print(r, "Style Transfer Text Result")
-
-
-def test_style_transfer_ref():
-    print("\n[TEST] Style Transfer (Reference)")
-    style_img = "/workspace/AIP/workspace/outputs/images/style_transfer_text_generated_style_1764690427.png"
-    
-    r = requests.post(
-        f"{WORKSPACE_SERVER}/style-transfer/ref",
-        json={
-            "content": TEST_IMAGE,
-            "style": style_img,
-            "prompt": "match lighting and texture from the reference",
-            "output_dir": OUTPUT_DIR,
-            "steps": 50
-        },
-        timeout=120
-    )
-    return pretty_print(r, "Style Transfer Reference Result")
-
-
-def test_color_grading():
-    print("\n[TEST] Color Grading")
-    r = requests.post(
-        f"{WORKSPACE_SERVER}/color-grading",
-        json={
-            "image": TEST_IMAGE,
-            "prompt": "cinematic teal shadows and warm highlights",
-            "mode": "both",
-            "output_dir_images": OUTPUT_DIR
-        },
-        timeout=120
-    )
-    return pretty_print(r, "Color Grading Result")
-
-
-def test_ai_suggestions():
-    print("\n[TEST] AI Suggestions")
-    r = requests.post(
-        f"{WORKSPACE_SERVER}/ai-suggestions",
-        json={"image": TEST_IMAGE},
-        timeout=60
-    )
-    return pretty_print(r, "AI Suggestions Result")
-
-
-def test_classify():
-    print("\n[TEST] Classify")
-    r = requests.post(
-        f"{WORKSPACE_SERVER}/classify",
-        json={
-            "prompt": "make this image look like a vintage film photograph",
-            "quick": False
-        },
-        timeout=30
-    )
-    return pretty_print(r, "Classification Result")
-
-
-def test_sam_segment():
-    print("\n[TEST] SAM Segmentation")
-    r = requests.post(
-        f"{WORKSPACE_SERVER}/sam/segment",
-        json={
-            "image": TEST_IMAGE,
-            "x": 150,
-            "y": 200,
-            "output_dir": "/workspace/AIP/workspace/outputs/segmentation"
-        },
-        timeout=120
-    )
-    return pretty_print(r, "SAM Segmentation Result")
-
-
 # =============================================================================
 # MAIN TEST SUITE
 # =============================================================================
@@ -336,6 +266,7 @@ def main():
         print(f"FLOW TEST {i}/{len(test_prompts)}")
         print('#'*60)
         
+        TEST_IMAGE = "/workspace/AIP/workspace/outputs/images/final_metric.png"
         result = timed(
             f"flow_{i}",
             ai_editing_flow,

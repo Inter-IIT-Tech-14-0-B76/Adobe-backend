@@ -35,3 +35,6 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", None)
 
 
 LOCAL_TMP_DIR = Path(os.getenv("CV_LOCAL_TMP_DIR", "/tmp/cv_images"))
+
+WORKSPACE_SERVER = os.getenv("WORKSPACE_SERVER", "http://localhost:8000")
+WORKSPACE_OUTPUT_DIR = Path(os.getenv("WORKSPACE_OUTPUT_DIR", "/workspace/AIP/workspace/outputs/images"))

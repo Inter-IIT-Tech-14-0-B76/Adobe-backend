@@ -1,4 +1,6 @@
 import json
+import os
+from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
 
@@ -21,6 +23,7 @@ from app.helpers.s3 import (
     _s3_presign_sync,
     _s3_put_object_sync,
 )
+from app.helpers.test_server import run_ai_editing_pipeline
 from app.utils.db import async_session
 from app.utils.models import (
     Image, 
@@ -28,6 +31,7 @@ from app.utils.models import (
     Project, 
     VersionHistory
 )
+from config import WORKSPACE_OUTPUT_DIR
 
 async def _delete_future_versions(session: AsyncSession, parent_id: str):
     """
@@ -65,7 +69,7 @@ async def _fetch_images_by_ids(session: AsyncSession, image_ids: List[str]) -> L
     "/images/upload",
     status_code=201,
     summary="Start Project & Upload Root",
-    description="Creates a project and the first version containing one or more images."
+    description="Creates a project and the first version containing one or more images. If prompt is provided, runs AI editing pipeline."
 )
 async def upload_physical_image(
     token_payload: Dict = Depends(verify_firebase_token),
@@ -99,8 +103,11 @@ async def upload_physical_image(
         session.add(project)
         await session.flush() 
 
-    new_images = []
-    image_ids = []
+    input_images = []
+    input_image_ids = []
+    local_input_paths = []
+
+    WORKSPACE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     for file in files:
         contents = await file.read()
@@ -111,7 +118,7 @@ async def upload_physical_image(
             _s3_put_object_sync, object_key, contents, file.content_type
         )
 
-        new_image = Image(
+        input_image = Image(
             id=str(uuid4()),
             project_id=project.id,
             object_key=object_key,
@@ -123,37 +130,146 @@ async def upload_physical_image(
             transformations={},
             generation_params=gen_params,
         )
-        session.add(new_image)
-        new_images.append(new_image)
-        image_ids.append(new_image.id)
+        session.add(input_image)
+        input_images.append(input_image)
+        input_image_ids.append(input_image.id)
+
+        if prompt:
+            local_input_path = WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{file.filename or 'image'}"
+            def write_file():
+                local_input_path.write_bytes(contents)
+            await anyio.to_thread.run_sync(write_file)
+            local_input_paths.append(local_input_path)
 
     await session.flush() 
 
-    new_version = VersionHistory(
+    version_1 = VersionHistory(
         id=str(uuid4()),
         project_id=project.id,
         parent_id=parent_version_id, 
-        image_ids=image_ids,
-        prompt=prompt,
+        image_ids=input_image_ids,
+        prompt=None,
         output_logs=f"Initial upload of {len(files)} image(s)",
     )
-    session.add(new_version)
-    
-    await session.flush() 
+    session.add(version_1)
+    await session.flush()
 
-    project.current_version_id = new_version.id
-    session.add(project)
+    if prompt and local_input_paths:
+        try:
+            input_path = str(local_input_paths[0])
+            pipeline_result = await anyio.to_thread.run_sync(
+                run_ai_editing_pipeline, input_path, prompt
+            )
 
-    await session.commit()
-    await session.refresh(new_version)
+            if pipeline_result.get('error'):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"AI pipeline failed: {pipeline_result.get('error')}"
+                )
 
-    resp = new_version.public_dict()
-    resp["images"] = []
-    for img in new_images:
-        img_dict = img.public_dict()
-        img_dict["presigned_url"] = _s3_presign_sync(img.object_key)
-        resp["images"].append(img_dict)
-    return resp
+            output_image_path = pipeline_result.get('output_image_path')
+            if not output_image_path or not Path(output_image_path).exists():
+                raise HTTPException(
+                    status_code=500,
+                    detail="AI pipeline did not produce output image"
+                )
+
+            def read_output():
+                return Path(output_image_path).read_bytes()
+            output_contents = await anyio.to_thread.run_sync(read_output)
+            output_sha256 = _compute_sha256(output_contents)
+            output_filename = Path(output_image_path).name
+            output_object_key = f"project/{project.id}/assets/{output_sha256}/{output_filename}"
+
+            await anyio.to_thread.run_sync(
+                _s3_put_object_sync,
+                output_object_key,
+                output_contents,
+                "image/png"
+            )
+
+            output_image = Image(
+                id=str(uuid4()),
+                project_id=project.id,
+                parent_image_id=input_images[0].id,
+                object_key=output_object_key,
+                file_name=output_filename,
+                mime_type="image/png",
+                sha256_hash=output_sha256,
+                action_type=ImageActionType.GENERATE,
+                is_virtual=False,
+                transformations={},
+                generation_params={
+                    **gen_params,
+                    "pipeline_result": pipeline_result,
+                    "prompt": prompt,
+                },
+            )
+            session.add(output_image)
+            await session.flush()
+
+            version_2 = VersionHistory(
+                id=str(uuid4()),
+                project_id=project.id,
+                parent_id=version_1.id,
+                image_ids=[output_image.id],
+                prompt=prompt,
+                output_logs=f"AI processed with prompt: {prompt}",
+            )
+            session.add(version_2)
+            await session.flush()
+
+            project.current_version_id = version_2.id
+            session.add(project)
+
+            for local_path in local_input_paths:
+                try:
+                    if local_path.exists():
+                        def delete_file(p=local_path):
+                            p.unlink()
+                        await anyio.to_thread.run_sync(delete_file)
+                except Exception:
+                    pass
+
+            await session.commit()
+            await session.refresh(version_2)
+
+            resp = version_2.public_dict()
+            resp["images"] = []
+            img_dict = output_image.public_dict()
+            img_dict["presigned_url"] = _s3_presign_sync(output_image.object_key)
+            resp["images"].append(img_dict)
+            return resp
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            for local_path in local_input_paths:
+                try:
+                    if local_path.exists():
+                        def delete_file(p=local_path):
+                            p.unlink()
+                        await anyio.to_thread.run_sync(delete_file)
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=500,
+                detail=f"AI pipeline error: {str(e)}"
+            )
+    else:
+        project.current_version_id = version_1.id
+        session.add(project)
+
+        await session.commit()
+        await session.refresh(version_1)
+
+        resp = version_1.public_dict()
+        resp["images"] = []
+        for img in input_images:
+            img_dict = img.public_dict()
+            img_dict["presigned_url"] = _s3_presign_sync(img.object_key)
+            resp["images"].append(img_dict)
+        return resp
 
 
 @image_router.post(
