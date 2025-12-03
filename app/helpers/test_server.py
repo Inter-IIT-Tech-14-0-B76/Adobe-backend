@@ -445,6 +445,7 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
             print("[WARN]: Classification not found in ")
             classification = classification_data
 
+        print("[INFOO]: classification", classification)
         tool = (
             classification.strip().lower()
         )  # .get('tool') or classification.get('classification', 'unknown')
