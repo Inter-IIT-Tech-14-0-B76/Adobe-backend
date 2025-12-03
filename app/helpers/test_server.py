@@ -445,9 +445,11 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
             else:
                 classification = classification_data
         else:
-            classification = {}
+            classification = "style-transfer-text"
 
-        tool = classification  # .get('tool') or classification.get('classification', 'unknown')
+        tool = (
+            classification.strip().lower()
+        )  # .get('tool') or classification.get('classification', 'unknown')
         params = {}
         # if tool == 'style-transfer-text':
         #     params = {
@@ -459,7 +461,7 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
         # elif tool == 'color-grading':
 
         # elif tool ==  'segmentation':
-        if tool == "default_mode":
+        if tool == "default_mode" or "style-transfer":
             tool = "style-transfer-text"
 
         debug_print(f"Detected tool: {tool}", "INFO")
