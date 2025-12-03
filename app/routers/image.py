@@ -1,5 +1,4 @@
 import json
-import os
 from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
@@ -14,7 +13,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
-from sqlmodel import col, select, desc
+from sqlmodel import col, desc, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.helpers.auth import upsert_user_from_token, verify_firebase_token
@@ -26,13 +25,9 @@ from app.helpers.s3 import (
 )
 from app.helpers.test_server import run_ai_editing_pipeline
 from app.utils.db import async_session
-from app.utils.models import (
-    Image, 
-    ImageActionType, 
-    Project, 
-    VersionHistory
-)
+from app.utils.models import Image, ImageActionType, Project, VersionHistory
 from config import WORKSPACE_OUTPUT_DIR
+
 
 async def _delete_future_versions(session: AsyncSession, parent_id: str):
     """
@@ -47,22 +42,26 @@ async def _delete_future_versions(session: AsyncSession, parent_id: str):
         await _delete_future_versions(session, child.id)
         await session.delete(child)
 
+
 image_router = APIRouter(tags=["Images and Versions"])
 
-async def _fetch_images_by_ids(session: AsyncSession, image_ids: List[str]) -> List[Image]:
+
+async def _fetch_images_by_ids(
+    session: AsyncSession, image_ids: List[str]
+) -> List[Image]:
     """
     Since we store IDs in a JSON blob, we must manually query the Image table
     to get the actual objects. We rely on the order of IDs in the blob.
     """
     if not image_ids:
         return []
-    
+
     statement = select(Image).where(col(Image.id).in_(image_ids))
     results = (await session.execute(statement)).scalars().all()
-    
+
     image_map = {img.id: img for img in results}
     ordered_images = [image_map[uid] for uid in image_ids if uid in image_map]
-    
+
     return ordered_images
 
 
@@ -70,11 +69,11 @@ async def _fetch_images_by_ids(session: AsyncSession, image_ids: List[str]) -> L
     "/images/upload",
     status_code=201,
     summary="Start Project & Upload Root",
-    description="Creates a project and the first version containing one or more images. If prompt is provided, runs AI editing pipeline."
+    description="Creates a project and the first version containing one or more images. If prompt is provided, runs AI editing pipeline.",
 )
 async def upload_physical_image(
     token_payload: Dict = Depends(verify_firebase_token),
-    project_id: Optional[str] = Form(None), 
+    project_id: Optional[str] = Form(None),
     parent_version_id: Optional[str] = Form(None),
     files: List[UploadFile] = File(...),
     action_type: ImageActionType = Form(ImageActionType.UPLOAD),
@@ -102,7 +101,7 @@ async def upload_physical_image(
             name=files[0].filename or "Untitled Project",
         )
         session.add(project)
-        await session.flush() 
+        await session.flush()
 
     input_images = []
     input_image_ids = []
@@ -113,8 +112,10 @@ async def upload_physical_image(
     for file in files:
         contents = await file.read()
         sha256_hash = _compute_sha256(contents)
-        object_key = f"project/{project.id}/assets/{sha256_hash}/{file.filename or 'image'}"
-        
+        object_key = (
+            f"project/{project.id}/assets/{sha256_hash}/{file.filename or 'image'}"
+        )
+
         await anyio.to_thread.run_sync(
             _s3_put_object_sync, object_key, contents, file.content_type
         )
@@ -136,18 +137,22 @@ async def upload_physical_image(
         input_image_ids.append(input_image.id)
 
         if prompt:
-            local_input_path = WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{file.filename or 'image'}"
+            local_input_path = (
+                WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{file.filename or 'image'}"
+            )
+
             def write_file():
                 local_input_path.write_bytes(contents)
+
             await anyio.to_thread.run_sync(write_file)
             local_input_paths.append(local_input_path)
 
-    await session.flush() 
+    await session.flush()
 
     version_1 = VersionHistory(
         id=str(uuid4()),
         project_id=project.id,
-        parent_id=parent_version_id, 
+        parent_id=parent_version_id,
         image_ids=input_image_ids,
         prompt=None,
         output_logs=f"Initial upload of {len(files)} image(s)",
@@ -158,35 +163,40 @@ async def upload_physical_image(
     if prompt and local_input_paths:
         try:
             input_path = str(local_input_paths[0])
+            # Pass all image paths for multi-image scenarios (e.g., style_transfer_ref)
+            all_image_paths = [str(p) for p in local_input_paths]
             pipeline_result = await anyio.to_thread.run_sync(
-                run_ai_editing_pipeline, input_path, prompt
+                lambda: run_ai_editing_pipeline(
+                    image_path=input_path,
+                    user_prompt=prompt,
+                    image_paths=all_image_paths if len(all_image_paths) > 1 else None,
+                )
             )
 
-            if pipeline_result.get('error'):
+            if pipeline_result.get("error"):
                 raise HTTPException(
                     status_code=500,
-                    detail=f"AI pipeline failed: {pipeline_result.get('error')}"
+                    detail=f"AI pipeline failed: {pipeline_result.get('error')}",
                 )
 
-            output_image_path = pipeline_result.get('output_image_path')
+            output_image_path = pipeline_result.get("output_image_path")
             if not output_image_path or not Path(output_image_path).exists():
                 raise HTTPException(
-                    status_code=500,
-                    detail="AI pipeline did not produce output image"
+                    status_code=500, detail="AI pipeline did not produce output image"
                 )
 
             def read_output():
                 return Path(output_image_path).read_bytes()
+
             output_contents = await anyio.to_thread.run_sync(read_output)
             output_sha256 = _compute_sha256(output_contents)
             output_filename = Path(output_image_path).name
-            output_object_key = f"project/{project.id}/assets/{output_sha256}/{output_filename}"
+            output_object_key = (
+                f"project/{project.id}/assets/{output_sha256}/{output_filename}"
+            )
 
             await anyio.to_thread.run_sync(
-                _s3_put_object_sync,
-                output_object_key,
-                output_contents,
-                "image/png"
+                _s3_put_object_sync, output_object_key, output_contents, "image/png"
             )
 
             output_image = Image(
@@ -226,8 +236,10 @@ async def upload_physical_image(
             for local_path in local_input_paths:
                 try:
                     if local_path.exists():
+
                         def delete_file(p=local_path):
                             p.unlink()
+
                         await anyio.to_thread.run_sync(delete_file)
                 except Exception:
                     pass
@@ -248,15 +260,14 @@ async def upload_physical_image(
             for local_path in local_input_paths:
                 try:
                     if local_path.exists():
+
                         def delete_file(p=local_path):
                             p.unlink()
+
                         await anyio.to_thread.run_sync(delete_file)
                 except Exception:
                     pass
-            raise HTTPException(
-                status_code=500,
-                detail=f"AI pipeline error: {str(e)}"
-            )
+            raise HTTPException(status_code=500, detail=f"AI pipeline error: {str(e)}")
     else:
         project.current_version_id = version_1.id
         session.add(project)
@@ -277,7 +288,7 @@ async def upload_physical_image(
     "/projects/{project_id}/prompt",
     status_code=201,
     summary="Process image with AI prompt",
-    description="Takes the latest image from the current version, runs AI pipeline with the provided prompt, and creates a new version with the result."
+    description="Takes the latest image from the current version, runs AI pipeline with the provided prompt, and creates a new version with the result.",
 )
 async def process_with_prompt(
     project_id: str,
@@ -297,7 +308,7 @@ async def process_with_prompt(
     if not project.current_version_id:
         raise HTTPException(
             status_code=400,
-            detail="Project has no current version. Please upload an image first."
+            detail="Project has no current version. Please upload an image first.",
         )
 
     current_version = await session.get(VersionHistory, project.current_version_id)
@@ -307,65 +318,81 @@ async def process_with_prompt(
     if not current_version.image_ids:
         raise HTTPException(
             status_code=400,
-            detail="Current version has no images. Please upload an image first."
+            detail="Current version has no images. Please upload an image first.",
         )
 
-    source_image_id = current_version.image_ids[-1]
-    source_image = await session.get(Image, source_image_id)
-    if not source_image:
-        raise HTTPException(status_code=404, detail="Source image not found")
+    # Fetch all images from current version (for multi-image scenarios like style_transfer_ref)
+    all_source_images = await _fetch_images_by_ids(session, current_version.image_ids)
+    if not all_source_images:
+        raise HTTPException(status_code=404, detail="Source images not found")
+
+    # Primary source image is the last one
+    source_image = all_source_images[-1]
 
     if not source_image.object_key:
-        raise HTTPException(
-            status_code=400,
-            detail="Source image has no S3 object key"
-        )
+        raise HTTPException(status_code=400, detail="Source image has no S3 object key")
 
     gen_params = json.loads(generation_params_str) if generation_params_str else {}
 
     WORKSPACE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    local_input_path = WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{source_image.file_name or 'image'}"
-
+    # Download all images for multi-image pipeline support
+    local_input_paths = []
     try:
-        image_bytes = await anyio.to_thread.run_sync(
-            _s3_get_object_bytes_sync, source_image.object_key
-        )
-
-        def write_file():
-            local_input_path.write_bytes(image_bytes)
-        await anyio.to_thread.run_sync(write_file)
-
-        input_path = str(local_input_path)
-        pipeline_result = await anyio.to_thread.run_sync(
-            run_ai_editing_pipeline, input_path, prompt
-        )
-
-        if pipeline_result.get('error'):
-            raise HTTPException(
-                status_code=500,
-                detail=f"AI pipeline failed: {pipeline_result.get('error')}"
+        for img in all_source_images:
+            if not img.object_key:
+                continue
+            local_path = (
+                WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{img.file_name or 'image'}"
+            )
+            image_bytes = await anyio.to_thread.run_sync(
+                _s3_get_object_bytes_sync, img.object_key
             )
 
-        output_image_path = pipeline_result.get('output_image_path')
-        if not output_image_path or not Path(output_image_path).exists():
+            def write_file(path=local_path, data=image_bytes):
+                path.write_bytes(data)
+
+            await anyio.to_thread.run_sync(write_file)
+            local_input_paths.append(local_path)
+
+        if not local_input_paths:
+            raise HTTPException(status_code=400, detail="No valid images to process")
+
+        input_path = str(local_input_paths[-1])  # Primary image (last one)
+        all_image_paths = [str(p) for p in local_input_paths]
+
+        pipeline_result = await anyio.to_thread.run_sync(
+            lambda: run_ai_editing_pipeline(
+                image_path=input_path,
+                user_prompt=prompt,
+                image_paths=all_image_paths if len(all_image_paths) > 1 else None,
+            )
+        )
+
+        if pipeline_result.get("error"):
             raise HTTPException(
                 status_code=500,
-                detail="AI pipeline did not produce output image"
+                detail=f"AI pipeline failed: {pipeline_result.get('error')}",
+            )
+
+        output_image_path = pipeline_result.get("output_image_path")
+        if not output_image_path or not Path(output_image_path).exists():
+            raise HTTPException(
+                status_code=500, detail="AI pipeline did not produce output image"
             )
 
         def read_output():
             return Path(output_image_path).read_bytes()
+
         output_contents = await anyio.to_thread.run_sync(read_output)
         output_sha256 = _compute_sha256(output_contents)
         output_filename = Path(output_image_path).name
-        output_object_key = f"project/{project_id}/assets/{output_sha256}/{output_filename}"
+        output_object_key = (
+            f"project/{project_id}/assets/{output_sha256}/{output_filename}"
+        )
 
         await anyio.to_thread.run_sync(
-            _s3_put_object_sync,
-            output_object_key,
-            output_contents,
-            "image/png"
+            _s3_put_object_sync, output_object_key, output_contents, "image/png"
         )
 
         output_image = Image(
@@ -402,10 +429,14 @@ async def process_with_prompt(
         project.current_version_id = new_version.id
         session.add(project)
 
-        if local_input_path.exists():
-            def delete_file():
-                local_input_path.unlink()
-            await anyio.to_thread.run_sync(delete_file)
+        # Clean up all local input files
+        for local_path in local_input_paths:
+            if local_path.exists():
+
+                def delete_file(p=local_path):
+                    p.unlink()
+
+                await anyio.to_thread.run_sync(delete_file)
 
         await session.commit()
         await session.refresh(new_version)
@@ -420,24 +451,25 @@ async def process_with_prompt(
     except HTTPException:
         raise
     except Exception as e:
-        if local_input_path.exists():
-            try:
-                def delete_file():
-                    local_input_path.unlink()
-                await anyio.to_thread.run_sync(delete_file)
-            except Exception:
-                pass
-        raise HTTPException(
-            status_code=500,
-            detail=f"AI pipeline error: {str(e)}"
-        )
+        # Clean up all local input files on error
+        for local_path in local_input_paths:
+            if local_path.exists():
+                try:
+
+                    def delete_file(p=local_path):
+                        p.unlink()
+
+                    await anyio.to_thread.run_sync(delete_file)
+                except Exception:
+                    pass
+        raise HTTPException(status_code=500, detail=f"AI pipeline error: {str(e)}")
 
 
 @image_router.post(
     "/images/upload/{project_id}",
     status_code=201,
     summary="Add image to project (New Version)",
-    description="Adds a new image to the current sequence. Does NOT duplicate existing images, just appends the ID."
+    description="Adds a new image to the current sequence. Does NOT duplicate existing images, just appends the ID.",
 )
 async def add_image_to_project(
     project_id: str,
@@ -453,16 +485,16 @@ async def add_image_to_project(
 
     parent_version = None
     previous_image_ids = []
-    
+
     if project.current_version_id:
         parent_version = await session.get(VersionHistory, project.current_version_id)
         if parent_version:
-            previous_image_ids = parent_version.image_ids.copy() 
+            previous_image_ids = parent_version.image_ids.copy()
 
     contents = await file.read()
     sha256_hash = _compute_sha256(contents)
     object_key = f"project/{project.id}/assets/{sha256_hash}/{file.filename}"
-    
+
     await anyio.to_thread.run_sync(
         _s3_put_object_sync, object_key, contents, file.content_type
     )
@@ -478,36 +510,36 @@ async def add_image_to_project(
         is_virtual=False,
     )
     session.add(new_image)
-    await session.flush() 
+    await session.flush()
 
-    new_state_ids = previous_image_ids + [new_image.id] 
-    
+    new_state_ids = previous_image_ids + [new_image.id]
+
     new_version = VersionHistory(
         id=str(uuid4()),
         project_id=project.id,
         parent_id=parent_version.id if parent_version else None,
-        image_ids=new_state_ids, 
+        image_ids=new_state_ids,
         prompt=parent_version.prompt if parent_version else None,
         output_logs="Added new image asset",
     )
     session.add(new_version)
-    
+
     await session.flush()
 
     project.current_version_id = new_version.id
     session.add(project)
-    
+
     await session.commit()
 
     full_images = await _fetch_images_by_ids(session, new_state_ids)
-    
+
     resp = new_version.public_dict()
     resp["images"] = []
     for img in full_images:
         d = img.public_dict()
         d["presigned_url"] = _s3_presign_sync(img.object_key)
         resp["images"].append(d)
-        
+
     return resp
 
 
@@ -523,12 +555,8 @@ async def create_virtual_edit(
     version_id: str = Body(..., description="The ID of the version to edit"),
     transformations: Dict = Body(...),
     prompt: Optional[str] = Body(None),
-    from_ai_screen: bool = Body(
-        False
-    ),
-    edited_file: Optional[UploadFile] = File(
-        None
-    ),
+    from_ai_screen: bool = Body(False),
+    edited_file: Optional[UploadFile] = File(None),
     session: AsyncSession = Depends(async_session),
 ):
     uploader = await upsert_user_from_token(token_payload, session, set_last_login=True)
@@ -540,8 +568,10 @@ async def create_virtual_edit(
     if not parent_version:
         raise HTTPException(status_code=404, detail="Version not found")
     if not parent_version.image_ids:
-        raise HTTPException(status_code=400, detail="The selected version contains no images to edit")
-    
+        raise HTTPException(
+            status_code=400, detail="The selected version contains no images to edit"
+        )
+
     source_image_id = parent_version.image_ids[-1]
 
     source_image = await session.get(Image, source_image_id)
@@ -598,40 +628,40 @@ async def create_virtual_edit(
             is_virtual=True,
         )
     session.add(new_edited_image)
-    await session.flush() 
+    await session.flush()
 
     new_image_ids = [
-        uid if uid != source_image_id else new_edited_image.id 
+        uid if uid != source_image_id else new_edited_image.id
         for uid in parent_version.image_ids
     ]
 
     new_version = VersionHistory(
         id=str(uuid4()),
         project_id=project_id,
-        parent_id=version_id, 
-        image_ids=new_image_ids, 
+        parent_id=version_id,
+        image_ids=new_image_ids,
         prompt=prompt if prompt else parent_version.prompt,
         output_logs=f"Edited version {version_id}",
     )
     session.add(new_version)
-    
-    await session.flush() 
-    
+
+    await session.flush()
+
     project.current_version_id = new_version.id
     session.add(project)
-    
+
     await session.commit()
     await session.refresh(new_version)
 
     full_images = await _fetch_images_by_ids(session, new_image_ids)
-    
+
     resp = new_version.public_dict()
     resp["images"] = []
     for img in full_images:
         d = img.public_dict()
         d["presigned_url"] = _s3_presign_sync(img.object_key)
         resp["images"].append(d)
-        
+
     return resp
 
 
@@ -666,37 +696,43 @@ async def get_current_project_state(
         img_dict = img.public_dict()
         img_dict["presigned_url"] = _s3_presign_sync(img.object_key)
         image_list.append(img_dict)
-        
+
     data["images"] = image_list
     return data
 
 
 @image_router.post("/projects/{project_id}/undo", status_code=200)
-async def undo_action(project_id: str, token_payload: Dict = Depends(verify_firebase_token), session: AsyncSession = Depends(async_session)):
+async def undo_action(
+    project_id: str,
+    token_payload: Dict = Depends(verify_firebase_token),
+    session: AsyncSession = Depends(async_session),
+):
     uploader = await upsert_user_from_token(token_payload, session)
     project = await session.get(Project, project_id)
-    if not project or project.user_id != uploader.id: raise HTTPException(status_code=403, detail="Auth Error")
+    if not project or project.user_id != uploader.id:
+        raise HTTPException(status_code=403, detail="Auth Error")
 
     current = await session.get(VersionHistory, project.current_version_id)
     if not current or not current.parent_id:
         raise HTTPException(status_code=400, detail="Cannot undo")
-    
+
     project.current_version_id = current.parent_id
     session.add(project)
     await session.commit()
 
     parent = await session.get(VersionHistory, current.parent_id)
     images = await _fetch_images_by_ids(session, parent.image_ids)
-    
+
     data = parent.public_dict()
     data["images"] = [i.public_dict() for i in images]
     return data
+
 
 @image_router.post(
     "/projects/{project_id}/redo",
     status_code=200,
     summary="Redo (Go to latest child version)",
-    description="Moves the project state forward to the most recently created child version."
+    description="Moves the project state forward to the most recently created child version.",
 )
 async def redo_action(
     project_id: str,
@@ -720,9 +756,11 @@ async def redo_action(
     )
     results = await session.execute(statement)
     child_version = results.scalar_one_or_none()
-    
+
     if not child_version:
-        raise HTTPException(status_code=400, detail="Nothing to redo (no child version found)")
+        raise HTTPException(
+            status_code=400, detail="Nothing to redo (no child version found)"
+        )
 
     project.current_version_id = child_version.id
     session.add(project)
@@ -738,6 +776,7 @@ async def redo_action(
         resp["images"].append(d)
 
     return resp
+
 
 @image_router.delete(
     "/projects/{project_id}",
@@ -764,7 +803,7 @@ async def delete_project(
     "/projects/{project_id}/versions",
     status_code=200,
     summary="Get all versions of a project",
-    description="Returns a list of all history versions for a project, ordered by creation date (newest first)."
+    description="Returns a list of all history versions for a project, ordered by creation date (newest first).",
 )
 async def get_project_versions(
     project_id: str,
@@ -788,7 +827,7 @@ async def get_project_versions(
     "/versions/{version_id}/images",
     status_code=200,
     summary="Get all images of a version",
-    description="Returns the full list of image objects (with presigned URLs) for a specific version state."
+    description="Returns the full list of image objects (with presigned URLs) for a specific version state.",
 )
 async def get_version_images(
     version_id: str,
@@ -817,7 +856,7 @@ async def get_version_images(
     "/images/{image_id}",
     status_code=200,
     summary="Get image details",
-    description="Returns the metadata and presigned URL for a specific image asset."
+    description="Returns the metadata and presigned URL for a specific image asset.",
 )
 async def get_image_details(
     image_id: str,
@@ -834,14 +873,15 @@ async def get_image_details(
 
     resp = image.public_dict()
     resp["presigned_url"] = _s3_presign_sync(image.object_key)
-    
+
     return resp
+
 
 @image_router.get(
     "/users/{user_id}/projects",
     status_code=200,
     summary="List projects for a specific user",
-    description="Returns a list of all projects belonging to the specified user ID. Enforces security so users can only view their own projects."
+    description="Returns a list of all projects belonging to the specified user ID. Enforces security so users can only view their own projects.",
 )
 async def list_projects_by_user(
     user_id: str,
@@ -852,7 +892,9 @@ async def list_projects_by_user(
     if not requester:
         raise HTTPException(status_code=401, detail="User invalid")
     if requester.id != user_id:
-        raise HTTPException(status_code=403, detail="Unauthorized to view projects for this user")
+        raise HTTPException(
+            status_code=403, detail="Unauthorized to view projects for this user"
+        )
 
     statement = (
         select(Project)
@@ -864,6 +906,7 @@ async def list_projects_by_user(
     projects = result.scalars().all()
 
     return [p.public_dict() for p in projects]
+
 
 @image_router.get("/", summary="Root endpoint", response_model=dict)
 async def root():

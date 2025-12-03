@@ -211,6 +211,49 @@ def test_style_transfer_ref(
         return None
 
 
+def test_style_transfer_ref_pipeline(
+    content_image: Optional[str] = None,
+    style_image: Optional[str] = None,
+    prompt: Optional[str] = None,
+):
+    """
+    Test style transfer with reference image using the full classification pipeline.
+    This tests the classifier's ability to detect style_transfer_ref and assign image roles.
+    """
+    print("\n--- Style Transfer Ref Pipeline Test ---")
+
+    if content_image is None:
+        content_image = DEFAULT_CONTENT_IMAGE
+    if style_image is None:
+        style_image = DEFAULT_STYLE_IMAGE
+    if prompt is None:
+        prompt = "apply the style of the first image to the second image"
+
+    debug_print(f"Content image: {content_image}", "REQUEST")
+    debug_print(f"Style image: {style_image}", "REQUEST")
+    debug_print(f"Prompt: {prompt}", "REQUEST")
+
+    # Provide image analyses with role hints
+    image_analyses = [
+        {"role": "style", "type": "reference"},
+        {"role": "content", "type": "target"},
+    ]
+
+    result = run_ai_editing_pipeline(
+        image_path=content_image,
+        user_prompt=prompt,
+        image_paths=[style_image, content_image],
+        image_analyses=image_analyses,
+    )
+
+    if result.get("error"):
+        debug_print(f"Pipeline error: {result.get('error')}", "ERROR")
+    else:
+        debug_print(f"Pipeline result: {json.dumps(result, indent=2)}", "RESPONSE")
+
+    return result
+
+
 def test_color_grading(image_path: str = None, prompt: str = None, mode: str = "both"):
     """Test color grading endpoint."""
     print("\n--- /color-grading ---")
@@ -361,21 +404,33 @@ def test_sam_segment(
 # =============================================================================
 
 
-def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]:
+def run_ai_editing_pipeline(
+    image_path: str,
+    user_prompt: str,
+    image_paths: Optional[list] = None,
+    image_analyses: Optional[list] = None,
+) -> Dict[str, Any]:
     """
     Run the complete AI editing pipeline: Analyze -> Classify -> Execute Tool.
 
     Args:
-        image_path: Path to the input image file
+        image_path: Path to the input image file (primary/first image)
         user_prompt: User's editing prompt/request
+        image_paths: Optional list of all image paths (for multi-image scenarios like style_transfer_ref)
+        image_analyses: Optional list of image analysis dicts (one per image)
 
     Returns:
         Dict with 'error' key if failed, or result dict with output paths
     """
+    # Build list of image paths
+    if image_paths is None:
+        image_paths = [image_path]
+    num_images = len(image_paths)
     debug_print("=" * 60, "INFO")
     debug_print("STARTING AI EDITING PIPELINE", "INFO")
     debug_print("=" * 60, "INFO")
-    debug_print(f"Image: {image_path}", "INFO")
+    debug_print(f"Image(s): {image_paths}", "INFO")
+    debug_print(f"Number of images: {num_images}", "INFO")
     debug_print(f"Prompt: {user_prompt}", "INFO")
 
     # Step 1: Analyze image
@@ -416,7 +471,12 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
     debug_print("\n[STEP 2/3] Classifying prompt...", "INFO")
     try:
         classify_url = f"{WORKSPACE_SERVER}/classify"
-        classify_payload = {"prompt": user_prompt, "quick": False}
+        classify_payload = {
+            "prompt": user_prompt,
+            "quick": False,
+            "num_images": num_images,
+            "image_analyses": image_analyses,
+        }
         debug_print(f"POST {classify_url}", "REQUEST")
         debug_print(f"Payload: {json.dumps(classify_payload, indent=2)}", "REQUEST")
 
@@ -440,28 +500,39 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
 
         # Handle different response formats
         if "classification" in classification_data:
-            classification = classification_data.get("classification", {})
+            classification = classification_data.get("classification", "")
         else:
-            print("[WARN]: Classification not found in ")
+            print("[WARN]: Classification not found in response")
             classification = classification_data
 
-        tool = (
-            classification.strip().lower()
-        )  # .get('tool') or classification.get('classification', 'unknown')
+        # Extract image_roles if present (for style_transfer_ref)
+        image_roles = classification_data.get("image_roles")
+
+        tool = classification.strip().lower() if isinstance(classification, str) else ""
         params = {}
-        # if tool == 'style-transfer-text':
-        #     params = {
 
-        #     }
-
-        # elif tool ==  'style-transfer-ref':
-
-        # elif tool == 'color-grading':
-
-        # elif tool ==  'segmentation':
-        if tool == "default_mode" or tool == "style-transfer":
+        # Map classification to tool endpoint
+        if tool == "style_transfer_ref" and num_images >= 2:
+            tool = "style-transfer-ref"
+            # Use image_roles to determine which image is style and which is content
+            if image_roles:
+                style_idx = image_roles.get("style_index", 0)
+                content_idx = image_roles.get("content_index", 1)
+                params["style_image"] = image_paths[style_idx]
+                params["content_image"] = image_paths[content_idx]
+                debug_print(
+                    f"Image roles - Style: {image_paths[style_idx]}, Content: {image_paths[content_idx]}",
+                    "INFO",
+                )
+            else:
+                # Default: first is style, second is content
+                params["style_image"] = image_paths[0]
+                params["content_image"] = (
+                    image_paths[1] if len(image_paths) > 1 else image_paths[0]
+                )
+        elif tool == "default_mode" or tool == "style_transfer":
             tool = "style-transfer-text"
-        if tool == "color_grading":
+        elif tool == "color_grading":
             tool = "color-grading"
 
         debug_print(f"Detected tool: {tool}", "INFO")
@@ -480,9 +551,16 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
     # Step 3: Execute tool
     debug_print("\n[STEP 3/3] Executing tool...", "INFO")
     try:
+        # For style-transfer-ref, use the content image as the primary image_path
+        primary_image = (
+            params.get("content_image", image_path)
+            if tool == "style-transfer-ref"
+            else image_path
+        )
+
         result = execute_tool(
             tool=tool,
-            image_path=image_path,
+            image_path=primary_image,
             prompt=user_prompt,
             params=params,
             ai_suggestions=ai_suggestions,
