@@ -106,6 +106,12 @@ async def upload_physical_image(
     input_images = []
     input_image_ids = []
     local_input_paths = []
+    l = [file.name for file in files]
+    print(f"""[INFOO]: Input Params: \n\n
+        files : {l}\n
+        prompt: {prompt}
+        \n\n
+        """)
 
     WORKSPACE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
