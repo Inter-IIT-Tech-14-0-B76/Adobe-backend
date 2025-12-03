@@ -463,6 +463,8 @@ def run_ai_editing_pipeline(image_path: str, user_prompt: str) -> Dict[str, Any]
         # elif tool ==  'segmentation':
         if tool == "default_mode" or "style-transfer":
             tool = "style-transfer-text"
+        if tool == "color_grading":
+            tool = "color-grading"
 
         debug_print(f"Detected tool: {tool}", "INFO")
         debug_print(f"Parameters: {json.dumps(params, indent=2)}", "INFO")
@@ -534,7 +536,7 @@ def execute_tool(tool, image_path, prompt, params, ai_suggestions):
     tool_endpoints = {
         "style-transfer-text": "/style-transfer/text",
         "style-transfer-ref": "/style-transfer/ref",
-        "color_grading": "/color-grading",
+        "color-grading": "/color-grading",
         "segmentation": "/sam/segment",
     }
 
