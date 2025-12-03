@@ -106,7 +106,7 @@ async def upload_physical_image(
     input_images = []
     input_image_ids = []
     local_input_paths = []
-    l = [file.name for file in files]
+    l = [str(file) for file in files]
     print(f"""[INFOO]: Input Params: \n\n
         files : {l}\n
         prompt: {prompt}
