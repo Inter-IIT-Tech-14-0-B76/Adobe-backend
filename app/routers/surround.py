@@ -361,9 +361,9 @@ async def update_with_prompt(
             await session.refresh(project_3d)
         except Exception as db_error:
             await session.rollback()
-            logger.error(f"Database error saving project_3d: {db_error}")
-            logger.error(
-                f"Project data: id={project_3d.id}, latest_job_key={project_3d.latest_job_key}, generation_count={project_3d.generation_count}"
+            print(f"[ERROR]:Database error saving project_3d: {db_error}")
+            print(
+                f"[ERROR]: Project data: id={project_3d.id}, latest_job_key={project_3d.latest_job_key}, generation_count={project_3d.generation_count}"
             )
             raise HTTPException(
                 status_code=500,
@@ -385,10 +385,10 @@ async def update_with_prompt(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in update_with_prompt: {e}")
+        print(f"Unexpected error in update_with_prompt: {e}")
         import traceback
 
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        print(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to update video: {str(e)}",
@@ -678,4 +678,3 @@ async def get_glb_by_project_id(
         token_payload=token_payload,
         session=session,
     )
-
