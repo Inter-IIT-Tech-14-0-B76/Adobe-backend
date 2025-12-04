@@ -22,6 +22,7 @@ The ID is consistent across all operations for conversational context.
 
 from pathlib import Path
 from typing import Dict, List, Optional
+import traceback
 from uuid import uuid4
 
 import anyio
@@ -428,59 +429,122 @@ async def get_glb_file(
     Raises:
         HTTPException: If ID not found, auth fails, or generation error.
     """
-    # Authenticate user
-    user = await upsert_user_from_token(token_payload, session, set_last_login=True)
-    if not user:
-        raise HTTPException(status_code=401, detail="User invalid")
+    try:
+        # Authenticate user
+        user = await upsert_user_from_token(token_payload, session, set_last_login=True)
+        if not user:
+            raise HTTPException(status_code=401, detail="User invalid")
+    except HTTPException:
+        # pass through HTTPExceptions raised intentionally above
+        raise
+    except Exception as e:
+        # Print and re-raise as 500
+        print(f"[get_glb_file] Error during user upsert/authentication: {e}")
+        try:
+            print(traceback.format_exc())
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Authentication error")
 
-    # Find the Project3D record
-    project_3d = await session.get(Project3D, surround_id)
-    if not project_3d:
-        raise HTTPException(
-            status_code=404,
-            detail=f"3D project with ID {surround_id} not found",
+    try:
+        # Find the Project3D record
+        project_3d = await session.get(Project3D, surround_id)
+        if not project_3d:
+            raise HTTPException(
+                status_code=404,
+                detail=f"3D project with ID {surround_id} not found",
+            )
+
+        # Verify ownership if linked to a project
+        if project_3d.p_id:
+            project = await session.get(Project, project_3d.p_id)
+            if project and project.user_id != user.id:
+                raise HTTPException(status_code=403, detail="Unauthorized")
+    except HTTPException:
+        # pass through intentional HTTPExceptions
+        raise
+    except Exception as e:
+        print(f"[get_glb_file] Error retrieving project or verifying ownership: {e}")
+        try:
+            print(traceback.format_exc())
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Project lookup error")
+
+    try:
+        # Generate GLB (always regenerate to get fresh S3 URL)
+        image_paths = project_3d.get_images()
+        job_key = project_3d.latest_job_key
+
+        # We need either images or a job_key to generate GLB
+        if not image_paths and not job_key:
+            raise HTTPException(
+                status_code=400,
+                detail="No images or job key available for GLB generation",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[get_glb_file] Error preparing GLB generation inputs: {e}")
+        try:
+            print(traceback.format_exc())
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Error preparing GLB inputs")
+
+    try:
+        # Generate GLB using todo_generate_glb (with job_key if available)
+        result = await anyio.to_thread.run_sync(
+            lambda: todo_generate_glb(
+                project_id=project_3d.id,
+                image_paths=image_paths,
+                latest_prompt=project_3d.latest_prompt,
+                job_key=job_key,
+            )
         )
+    except Exception as e:
+        print(f"[get_glb_file] Exception during GLB generation call: {e}")
+        try:
+            print(traceback.format_exc())
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="GLB generation call failed")
 
-    # Verify ownership if linked to a project
-    if project_3d.p_id:
-        project = await session.get(Project, project_3d.p_id)
-        if project and project.user_id != user.id:
-            raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        if not result.get("success"):
+            print(f"[get_glb_file] GLB generation returned failure result: {result}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"GLB generation failed: {result.get('error')}",
+            )
 
-    # Generate GLB (always regenerate to get fresh S3 URL)
-    image_paths = project_3d.get_images()
-    job_key = project_3d.latest_job_key
+        # Update the project with GLB path
+        glb_path = result.get("glb_path")
+        glb_url = result.get("glb_url")
+        glb_object_key = result.get("glb_object_key")
+        project_3d.glb_file_path = glb_path
+        session.add(project_3d)
+        await session.commit()
 
-    # We need either images or a job_key to generate GLB
-    if not image_paths and not job_key:
-        raise HTTPException(
-            status_code=400,
-            detail="No images or job key available for GLB generation",
-        )
-
-    # Generate GLB using todo_generate_glb (with job_key if available)
-    result = await anyio.to_thread.run_sync(
-        lambda: todo_generate_glb(
-            project_id=project_3d.id,
-            image_paths=image_paths,
-            latest_prompt=project_3d.latest_prompt,
-            job_key=job_key,
-        )
-    )
-
-    if not result.get("success"):
-        raise HTTPException(
-            status_code=500,
-            detail=f"GLB generation failed: {result.get('error')}",
-        )
-
-    # Update the project with GLB path
-    glb_path = result.get("glb_path")
-    glb_url = result.get("glb_url")
-    glb_object_key = result.get("glb_object_key")
-    project_3d.glb_file_path = glb_path
-    session.add(project_3d)
-    await session.commit()
+    except HTTPException:
+        # rollback on intentional HTTPException then re-raise
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        # rollback and return a 500
+        print(f"[get_glb_file] Error updating DB or committing GLB info: {e}")
+        try:
+            print(traceback.format_exc())
+        except Exception:
+            pass
+        try:
+            await session.rollback()
+        except Exception as re:
+            print(f"[get_glb_file] Error during rollback: {re}")
+        raise HTTPException(status_code=500, detail="Failed to save GLB information")
 
     return {
         "id": surround_id,
