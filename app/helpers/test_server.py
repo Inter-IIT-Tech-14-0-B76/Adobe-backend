@@ -780,7 +780,14 @@ def run_ai_editing_pipeline(
         elif tool == "color_grading":
             tool = "color-grading"
         elif tool == "manual":
-            tool = "default"
+            debug_print(
+                "Classification is 'default' - routing to ComfyUI pipeline", "INFO"
+            )
+            return _run_comfy_pipeline(
+                image_paths=image_paths,
+                prompt=user_prompt,
+                num_images=num_images,
+            )
 
         debug_print(f"Detected tool: {tool}", "INFO")
         debug_print(f"Parameters: {json.dumps(params, indent=2)}", "INFO")
