@@ -193,24 +193,58 @@ async def create_surround_project(
         project_3d.add_to_history(prompt=None, video_path=video_path, job_key=job_key)
 
         # Save to database
-        session.add(project_3d)
-        await session.commit()
-        await session.refresh(project_3d)
+        try:
+            session.add(project_3d)
+            await session.commit()
+            print(f"[CREATE] Database commit successful for {project_3d.id}")
+        except Exception as db_err:
+            print(f"[CREATE] Database commit failed: {str(db_err)}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database save failed: {str(db_err)}",
+            )
 
-        return {
-            "id": project_3d.id,
-            "video_url": video_url,
-            "video_object_key": video_object_key,
-            "job_key": job_key,
-            "images": project_3d.get_images(),
-            "generation_count": project_3d.generation_count,
-            "project_3d": project_3d.public_dict(),
-            "message": "3D project created successfully with initial video",
-        }
+        try:
+            await session.refresh(project_3d)
+        except Exception as refresh_err:
+            print(f"[CREATE] Session refresh failed: {str(refresh_err)}")
+            # Continue anyway - data is saved
+
+        try:
+            response_data = {
+                "id": project_3d.id,
+                "video_url": video_url,
+                "video_object_key": video_object_key,
+                "job_key": job_key,
+                "images": project_3d.get_images(),
+                "generation_count": int(project_3d.generation_count),
+                "project_3d": project_3d.public_dict(),
+                "message": "3D project created successfully with initial video",
+            }
+            print(f"[CREATE] Response prepared successfully")
+            return response_data
+        except Exception as resp_err:
+            print(f"[CREATE] Response preparation failed: {str(resp_err)}")
+            import traceback
+            traceback.print_exc()
+            # Return minimal response
+            return {
+                "id": project_3d.id,
+                "video_url": video_url,
+                "video_object_key": video_object_key,
+                "job_key": job_key,
+                "message": "Video created (response error, data saved)",
+                "error_detail": str(resp_err),
+            }
 
     except HTTPException:
         raise
     except Exception as e:
+        print(f"[CREATE] Unexpected error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Failed to create 3D project: {str(e)}",
