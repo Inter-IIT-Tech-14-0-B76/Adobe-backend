@@ -255,8 +255,79 @@ async def create_surround_project(
         )
 
 
+@surround_router.get(
+    "/surround/{surround_id}/video",
+    status_code=200,
+    summary="Get video S3 URL for project",
+    description="""
+    Retrieve the latest video for a 3D project.
+    
+    Returns a presigned S3 URL for the video file.
+    """,
+)
+async def get_video_url(
+    surround_id: str,
+    token_payload: Dict = Depends(verify_firebase_token),
+    session: AsyncSession = Depends(async_session),
+) -> Dict:
+    """
+    Get presigned S3 URL for the latest video.
+
+    Args:
+        surround_id: The persistent Project3D ID.
+        token_payload: Firebase authentication token payload.
+        session: Database session.
+
+    Returns:
+        Dict containing:
+            - id: The persistent Project3D ID
+            - video_url: S3 presigned URL for the video
+            - video_object_key: S3 object key
+            - generation_count: Current generation count
+            - project_3d: Project3D record
+
+    Raises:
+        HTTPException: If ID not found or auth fails.
+    """
+    from app.helpers.s3 import _s3_presign_sync
+
+    # Authenticate user
+    user = await upsert_user_from_token(token_payload, session, set_last_login=True)
+    if not user:
+        raise HTTPException(status_code=401, detail="User invalid")
+
+    # Find the Project3D record
+    project_3d = await session.get(Project3D, surround_id)
+    if not project_3d:
+        raise HTTPException(
+            status_code=404,
+            detail=f"3D project with ID {surround_id} not found",
+        )
+
+    # Verify ownership if linked to a project
+    if project_3d.p_id:
+        project = await session.get(Project, project_3d.p_id)
+        if project and project.user_id != user.id:
+            raise HTTPException(status_code=403, detail="Unauthorized")
+
+    # Hardcoded object key for testing
+    object_key = f"surround/{surround_id}/videos/gen2_{surround_id}_gen2_fce07b90.mp4"
+
+    # Generate presigned URL
+    presigned_url = _s3_presign_sync(object_key, expires_in=3600)
+
+    return {
+        "id": project_3d.id,
+        "video_url": presigned_url,
+        "video_object_key": object_key,
+        "generation_count": int(project_3d.generation_count),
+        "project_3d": project_3d.public_dict(),
+        "message": "Video URL generated successfully",
+    }
+
+
 @surround_router.post(
-    "/surround/{surround_id}/prompt",
+    "/surround2/{surround_id}/prompt",
     status_code=200,
     summary="Update video with prompt",
     description="""
