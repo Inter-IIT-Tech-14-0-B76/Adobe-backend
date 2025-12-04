@@ -7,12 +7,13 @@ This module provides utility functions for the conversational 3D workflow:
 - todo_generate_glb: Generate GLB file via /convert API
 
 Storage locations:
-- GLB files: /workspace/backend/glb/
-- Demo videos: /workspace/backend/demo_videos/
+- S3: Videos and GLB files are uploaded to S3 for frontend access
+- Local temp: /workspace/backend/demo_videos/ (temporary before S3 upload)
 
 External APIs:
 - INFER_HOST: Generates MP4 video from 4 input images
 - CONVERT_HOST: Converts to GLB format using the job key
+- WORKSPACE_SERVER: Style transfer endpoints for prompt-based styling
 """
 
 from __future__ import annotations
@@ -24,7 +25,13 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-# Storage directories for 3D assets
+from app.helpers.s3 import (
+    _s3_put_object_sync,
+    _s3_presign_sync,
+)
+from config import WORKSPACE_SERVER
+
+# Storage directories for 3D assets (local temp storage)
 GLB_STORAGE_DIR = Path("/workspace/backend/glb")
 DEMO_VIDEO_STORAGE_DIR = Path("/workspace/backend/demo_videos")
 
@@ -39,12 +46,269 @@ CONVERT_HOST = os.getenv(
 # Timeout settings (in seconds)
 INFER_TIMEOUT = 1200  # 20 minutes for video generation
 CONVERT_TIMEOUT = 1800  # 30 minutes for GLB conversion
+STYLE_TRANSFER_TIMEOUT = 120  # 2 minutes per image
 
 
 class SurroundProcessingError(Exception):
     """Exception raised for errors during 3D/surround processing."""
 
     pass
+
+
+def _upload_video_to_s3(
+    local_path: str,
+    project_id: str,
+    generation_number: int = 1,
+) -> Dict[str, Any]:
+    """
+    Upload a video file to S3 and return the object key and presigned URL.
+
+    Args:
+        local_path: Local path to the video file.
+        project_id: Project ID for organizing in S3.
+        generation_number: Generation number for the video.
+
+    Returns:
+        Dict containing:
+            - success: Boolean indicating if upload succeeded
+            - object_key: S3 object key
+            - presigned_url: Presigned URL for frontend access
+            - error: Error message if failed
+    """
+    try:
+        path_obj = Path(local_path)
+        if not path_obj.exists():
+            return {
+                "success": False,
+                "object_key": None,
+                "presigned_url": None,
+                "error": f"Local video file not found: {local_path}",
+            }
+
+        video_bytes = path_obj.read_bytes()
+        filename = path_obj.name
+        object_key = f"surround/{project_id}/videos/gen{generation_number}_{filename}"
+
+        print(f"[S3] Uploading video to {object_key}")
+        _s3_put_object_sync(object_key, video_bytes, "video/mp4")
+
+        presigned_url = _s3_presign_sync(object_key, expires_in=3600)
+        print(f"[S3] Video uploaded successfully: {object_key}")
+
+        return {
+            "success": True,
+            "object_key": object_key,
+            "presigned_url": presigned_url,
+            "error": None,
+        }
+
+    except Exception as e:
+        error_msg = f"S3 upload failed: {str(e)}"
+        print(f"[S3] {error_msg}")
+        return {
+            "success": False,
+            "object_key": None,
+            "presigned_url": None,
+            "error": error_msg,
+        }
+
+
+def _upload_glb_to_s3(
+    local_path: str,
+    project_id: str,
+) -> Dict[str, Any]:
+    """
+    Upload a GLB file to S3 and return the object key and presigned URL.
+
+    Args:
+        local_path: Local path to the GLB file.
+        project_id: Project ID for organizing in S3.
+
+    Returns:
+        Dict containing:
+            - success: Boolean indicating if upload succeeded
+            - object_key: S3 object key
+            - presigned_url: Presigned URL for frontend access
+            - error: Error message if failed
+    """
+    try:
+        path_obj = Path(local_path)
+        if not path_obj.exists():
+            return {
+                "success": False,
+                "object_key": None,
+                "presigned_url": None,
+                "error": f"Local GLB file not found: {local_path}",
+            }
+
+        glb_bytes = path_obj.read_bytes()
+        filename = path_obj.name
+        object_key = f"surround/{project_id}/glb/{filename}"
+
+        print(f"[S3] Uploading GLB to {object_key}")
+        _s3_put_object_sync(object_key, glb_bytes, "model/gltf-binary")
+
+        presigned_url = _s3_presign_sync(object_key, expires_in=3600)
+        print(f"[S3] GLB uploaded successfully: {object_key}")
+
+        return {
+            "success": True,
+            "object_key": object_key,
+            "presigned_url": presigned_url,
+            "error": None,
+        }
+
+    except Exception as e:
+        error_msg = f"S3 GLB upload failed: {str(e)}"
+        print(f"[S3] {error_msg}")
+        return {
+            "success": False,
+            "object_key": None,
+            "presigned_url": None,
+            "error": error_msg,
+        }
+
+
+def _apply_style_transfer_to_image(
+    image_path: str,
+    prompt: str,
+    output_dir: str,
+) -> Dict[str, Any]:
+    """
+    Apply style transfer to a single image using the style-transfer/text endpoint.
+
+    Args:
+        image_path: Path to the input image.
+        prompt: Style prompt to apply.
+        output_dir: Directory for output files.
+
+    Returns:
+        Dict containing:
+            - success: Boolean
+            - output_path: Path to styled image
+            - error: Error message if failed
+    """
+    try:
+        url = f"{WORKSPACE_SERVER}/style-transfer/text"
+        payload = {
+            "content": image_path,
+            "style_text": prompt,
+            "prompt": prompt,
+            "output_dir": output_dir,
+            "steps": 40,
+            "style_steps": 20,
+            "max_side": 1024,
+        }
+
+        print(f"[STYLE] POST {url}")
+        print(f"[STYLE] Image: {image_path}, Prompt: {prompt[:50]}...")
+
+        response = requests.post(url, json=payload, timeout=STYLE_TRANSFER_TIMEOUT)
+
+        if response.status_code != 200:
+            error_msg = f"Style transfer failed: {response.status_code}"
+            try:
+                error_detail = response.json()
+                error_msg += f": {error_detail}"
+            except Exception:
+                error_msg += f": {response.text[:200]}"
+            return {
+                "success": False,
+                "output_path": None,
+                "error": error_msg,
+            }
+
+        result = response.json()
+
+        # Extract output path from response
+        output_paths = result.get("output_paths", {})
+        output_path = (
+            output_paths.get("composite")
+            or output_paths.get("styled_only")
+            or result.get("output_composite")
+            or result.get("output_styled_only")
+        )
+
+        if not output_path:
+            return {
+                "success": False,
+                "output_path": None,
+                "error": "Style transfer did not return output path",
+            }
+
+        print(f"[STYLE] Output: {output_path}")
+        return {
+            "success": True,
+            "output_path": output_path,
+            "error": None,
+        }
+
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "output_path": None,
+            "error": f"Style transfer timed out after {STYLE_TRANSFER_TIMEOUT}s",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "output_path": None,
+            "error": f"Style transfer error: {str(e)}",
+        }
+
+
+def apply_style_transfer_to_images(
+    image_paths: List[str],
+    prompt: str,
+    output_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Apply style transfer to all images using the given prompt.
+
+    Args:
+        image_paths: List of paths to input images.
+        prompt: Style prompt to apply to all images.
+        output_dir: Optional output directory.
+
+    Returns:
+        Dict containing:
+            - success: Boolean
+            - styled_paths: List of paths to styled images
+            - error: Error message if any image failed
+    """
+    if output_dir is None:
+        output_dir = str(DEMO_VIDEO_STORAGE_DIR / "styled")
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    styled_paths = []
+    print(f"[STYLE] Applying style transfer to {len(image_paths)} images")
+    print(f"[STYLE] Prompt: {prompt}")
+
+    for i, img_path in enumerate(image_paths):
+        print(f"[STYLE] Processing image {i+1}/{len(image_paths)}: {img_path}")
+
+        result = _apply_style_transfer_to_image(
+            image_path=img_path,
+            prompt=prompt,
+            output_dir=output_dir,
+        )
+
+        if not result["success"]:
+            return {
+                "success": False,
+                "styled_paths": styled_paths,
+                "error": f"Image {i+1} failed: {result['error']}",
+            }
+
+        styled_paths.append(result["output_path"])
+
+    print(f"[STYLE] All {len(styled_paths)} images styled successfully")
+    return {
+        "success": True,
+        "styled_paths": styled_paths,
+        "error": None,
+    }
 
 
 def ensure_storage_directories() -> None:
@@ -303,6 +567,7 @@ def todo_generate_video(
 
     This is the first step in the conversational workflow. User uploads 4 images
     and an initial video is generated via the external LGM inference service.
+    The video is then uploaded to S3 for frontend access.
 
     Args:
         image_paths: List of paths to input images (expects 4 images).
@@ -310,25 +575,21 @@ def todo_generate_video(
 
     Returns:
         Dict containing:
-            - video_path: Path to the generated video file
+            - video_path: Local path to the generated video file
+            - video_url: S3 presigned URL for frontend access
+            - video_object_key: S3 object key
             - success: Boolean indicating if processing succeeded
             - error: Error message if processing failed (None on success)
             - generation_number: The generation number (1 for initial)
             - key: The job key used (needed for GLB conversion)
-
-    Example:
-        >>> result = todo_generate_video(
-        ...     image_paths=["view0.png", "view1.png", "view2.png", "view3.png"],
-        ...     project_id="abc123"
-        ... )
-        >>> print(result["video_path"])
-        /workspace/backend/demo_videos/abc123_gen1_a1b2c3d4.mp4
     """
     if len(image_paths) < 4:
         return {
             "video_path": None,
+            "video_url": None,
+            "video_object_key": None,
             "success": False,
-            "error": f"4 images required for video generation, got {len(image_paths)}",
+            "error": f"4 images required, got {len(image_paths)}",
             "generation_number": 0,
             "key": None,
         }
@@ -340,7 +601,7 @@ def todo_generate_video(
         # Generate the output video path
         video_path = generate_video_path(project_id, generation_number=1)
 
-        print(f"[todo_generate_video] Starting video generation")
+        print("[todo_generate_video] Starting video generation")
         print(f"[todo_generate_video] Project ID: {project_id}")
         print(f"[todo_generate_video] Job key: {job_key}")
         print(f"[todo_generate_video] Image paths: {image_paths[:4]}")
@@ -355,14 +616,38 @@ def todo_generate_video(
         if not result["success"]:
             return {
                 "video_path": None,
+                "video_url": None,
+                "video_object_key": None,
                 "success": False,
                 "error": result["error"],
                 "generation_number": 0,
                 "key": job_key,
             }
 
+        # Upload video to S3
+        print("[todo_generate_video] Uploading video to S3...")
+        s3_result = _upload_video_to_s3(
+            local_path=result["video_path"],
+            project_id=project_id,
+            generation_number=1,
+        )
+
+        if not s3_result["success"]:
+            return {
+                "video_path": result["video_path"],
+                "video_url": None,
+                "video_object_key": None,
+                "success": False,
+                "error": f"S3 upload failed: {s3_result['error']}",
+                "generation_number": 1,
+                "key": job_key,
+            }
+
+        print("[todo_generate_video] Video generation complete")
         return {
             "video_path": result["video_path"],
+            "video_url": s3_result["presigned_url"],
+            "video_object_key": s3_result["object_key"],
             "success": True,
             "error": None,
             "generation_number": 1,
@@ -372,6 +657,8 @@ def todo_generate_video(
     except Exception as e:
         return {
             "video_path": None,
+            "video_url": None,
+            "video_object_key": None,
             "success": False,
             "error": f"Video generation failed: {str(e)}",
             "generation_number": 0,
@@ -389,121 +676,147 @@ def todo_generate_video_from_prompt(
     """
     Generate updated video based on prompt and optionally new images.
 
-    This is used for subsequent updates in the conversational workflow.
-    If no new images are provided, the original images are used.
-    Calls the /infer API with the selected images.
+    This function applies style transfer to all 4 images using the prompt,
+    then generates a video from the styled images. The video is uploaded to S3.
+
+    Flow:
+    1. Apply style_transfer_with_text to all 4 images using the prompt
+    2. Use the 4 styled images to call /infer API
+    3. Upload the resulting video to S3
+    4. Return S3 URL and new job_key (for GLB conversion)
 
     Args:
         original_images: List of original image paths stored for this project.
-        prompt: Text prompt describing the desired changes/style.
-        new_images: Optional list of new image paths to replace/augment originals.
+        prompt: Text prompt describing the desired style/changes.
+        new_images: Optional list of new image paths to replace originals.
         project_id: The project ID for file naming.
         generation_number: The current generation number for versioning.
 
     Returns:
         Dict containing:
-            - video_path: Path to the generated video file
+            - video_path: Local path to the generated video file
+            - video_url: S3 presigned URL for frontend access
+            - video_object_key: S3 object key
             - success: Boolean indicating if processing succeeded
             - error: Error message if processing failed (None on success)
             - generation_number: The new generation number
-            - images_used: List of image paths that were used
+            - images_used: List of image paths that were used (styled images)
             - prompt_applied: The prompt that was applied
             - key: The job key used (needed for GLB conversion)
-
-    Example:
-        >>> result = todo_generate_video_from_prompt(
-        ...     original_images=["v0.png", "v1.png", "v2.png", "v3.png"],
-        ...     prompt="Make it look more futuristic",
-        ...     project_id="abc123",
-        ...     generation_number=1
-        ... )
     """
     # Determine which images to use
     images_to_use = (
         new_images if new_images and len(new_images) >= 4 else original_images
     )
 
+    base_error_response = {
+        "video_path": None,
+        "video_url": None,
+        "video_object_key": None,
+        "success": False,
+        "generation_number": generation_number,
+        "images_used": images_to_use[:4] if images_to_use else [],
+        "prompt_applied": prompt,
+        "key": None,
+    }
+
     if not images_to_use or len(images_to_use) < 4:
-        return {
-            "video_path": None,
-            "success": False,
-            "error": "4 images required for video generation",
-            "generation_number": generation_number,
-            "images_used": images_to_use or [],
-            "prompt_applied": prompt,
-            "key": None,
-        }
+        base_error_response["error"] = "4 images required for video generation"
+        return base_error_response
 
     if not prompt:
-        return {
-            "video_path": None,
-            "success": False,
-            "error": "Prompt is required for video update",
-            "generation_number": generation_number,
-            "images_used": images_to_use,
-            "prompt_applied": None,
-            "key": None,
-        }
+        base_error_response["error"] = "Prompt is required for video update"
+        base_error_response["prompt_applied"] = None
+        return base_error_response
 
     try:
         new_gen_number = generation_number + 1
         effective_project_id = project_id or uuid.uuid4().hex
 
-        # Generate unique key for this job
-        job_key = f"{effective_project_id}_gen{new_gen_number}_{uuid.uuid4().hex[:8]}"
+        print("[prompt_video] Starting prompt-based video generation")
+        print(f"[prompt_video] Prompt: {prompt}")
+        print(f"[prompt_video] Images: {images_to_use[:4]}")
+        print(f"[prompt_video] Generation: {new_gen_number}")
+
+        # Step 1: Apply style transfer to all 4 images
+        print("[prompt_video] Step 1: Applying style transfer to images...")
+        style_result = apply_style_transfer_to_images(
+            image_paths=images_to_use[:4],
+            prompt=prompt,
+        )
+
+        if not style_result["success"]:
+            base_error_response["error"] = (
+                f"Style transfer failed: {style_result['error']}"
+            )
+            return base_error_response
+
+        styled_images = style_result["styled_paths"]
+        print(f"[prompt_video] Styled images: {styled_images}")
+
+        # Step 2: Generate unique key for this job (NEW key for styled images)
+        job_key = (
+            f"{effective_project_id}_gen{new_gen_number}_{uuid.uuid4().hex[:8]}"
+        )
 
         # Generate the output video path
         video_path = generate_video_path(
             effective_project_id, generation_number=new_gen_number
         )
 
-        print(f"[todo_generate_video_from_prompt] Starting video generation")
-        print(f"[todo_generate_video_from_prompt] Prompt: {prompt}")
-        print(f"[todo_generate_video_from_prompt] Job key: {job_key}")
-        print(f"[todo_generate_video_from_prompt] Images: {images_to_use[:4]}")
-        print(f"[todo_generate_video_from_prompt] Generation: {new_gen_number}")
+        print(f"[prompt_video] Step 2: Calling /infer with styled images...")
+        print(f"[prompt_video] Job key: {job_key}")
 
-        # Call the /infer API
-        # Note: The prompt is stored for reference but the current /infer API
-        # doesn't use text prompts - it generates from images only.
-        # Future enhancement: pass prompt to a different endpoint if available.
+        # Step 3: Call the /infer API with styled images
         result = _call_infer_api(
-            image_paths=images_to_use[:4],
+            image_paths=styled_images,
             key=job_key,
             output_mp4_path=video_path,
         )
 
         if not result["success"]:
+            base_error_response["error"] = result["error"]
+            base_error_response["key"] = job_key
+            base_error_response["images_used"] = styled_images
+            return base_error_response
+
+        # Step 4: Upload video to S3
+        print("[prompt_video] Step 3: Uploading video to S3...")
+        s3_result = _upload_video_to_s3(
+            local_path=result["video_path"],
+            project_id=effective_project_id,
+            generation_number=new_gen_number,
+        )
+
+        if not s3_result["success"]:
             return {
-                "video_path": None,
+                "video_path": result["video_path"],
+                "video_url": None,
+                "video_object_key": None,
                 "success": False,
-                "error": result["error"],
-                "generation_number": generation_number,
-                "images_used": images_to_use[:4],
+                "error": f"S3 upload failed: {s3_result['error']}",
+                "generation_number": new_gen_number,
+                "images_used": styled_images,
                 "prompt_applied": prompt,
                 "key": job_key,
             }
 
+        print("[prompt_video] Video generation with prompt complete")
         return {
             "video_path": result["video_path"],
+            "video_url": s3_result["presigned_url"],
+            "video_object_key": s3_result["object_key"],
             "success": True,
             "error": None,
             "generation_number": new_gen_number,
-            "images_used": images_to_use[:4],
+            "images_used": styled_images,
             "prompt_applied": prompt,
             "key": job_key,
         }
 
     except Exception as e:
-        return {
-            "video_path": None,
-            "success": False,
-            "error": f"Prompt-based video generation failed: {str(e)}",
-            "generation_number": generation_number,
-            "images_used": images_to_use[:4] if images_to_use else [],
-            "prompt_applied": prompt,
-            "key": None,
-        }
+        base_error_response["error"] = f"Prompt-based generation failed: {str(e)}"
+        return base_error_response
 
 
 def todo_generate_glb(
@@ -517,7 +830,7 @@ def todo_generate_glb(
 
     If a job_key is provided (from a prior video generation), it uses that key
     to convert the existing PLY to GLB. Otherwise, it first calls /infer to
-    generate the 3D data, then calls /convert.
+    generate the 3D data, then calls /convert. The GLB is uploaded to S3.
 
     Args:
         project_id: The project ID to generate GLB for.
@@ -527,27 +840,22 @@ def todo_generate_glb(
 
     Returns:
         Dict containing:
-            - glb_path: Path to the generated GLB file
+            - glb_path: Local path to the generated GLB file
+            - glb_url: S3 presigned URL for frontend access
+            - glb_object_key: S3 object key
             - success: Boolean indicating if processing succeeded
             - error: Error message if processing failed (None on success)
             - key: The job key used
-
-    Example:
-        >>> result = todo_generate_glb(
-        ...     project_id="abc123",
-        ...     image_paths=["v0.png", "v1.png", "v2.png", "v3.png"],
-        ...     job_key="abc123_gen1_12345678"
-        ... )
-        >>> print(result["glb_path"])
-        /workspace/backend/glb/abc123_a1b2c3d4.glb
     """
     if not image_paths or len(image_paths) < 4:
         # If we have a job_key, we can still try to convert
         if not job_key:
             return {
                 "glb_path": None,
+                "glb_url": None,
+                "glb_object_key": None,
                 "success": False,
-                "error": "4 images required for GLB generation (or provide job_key)",
+                "error": "4 images required for GLB (or provide job_key)",
                 "key": None,
             }
 
@@ -555,7 +863,7 @@ def todo_generate_glb(
         # Generate the output GLB path
         glb_path = generate_glb_path(project_id)
 
-        print(f"[todo_generate_glb] Starting GLB generation")
+        print("[todo_generate_glb] Starting GLB generation")
         print(f"[todo_generate_glb] Project ID: {project_id}")
         print(f"[todo_generate_glb] Latest prompt: {latest_prompt}")
 
@@ -566,7 +874,7 @@ def todo_generate_glb(
         if not effective_key:
             effective_key = f"{project_id}_glb_{uuid.uuid4().hex[:8]}"
 
-            print(f"[todo_generate_glb] No job_key, running /infer first")
+            print("[todo_generate_glb] No job_key, running /infer first")
             print(f"[todo_generate_glb] New key: {effective_key}")
 
             # Generate a temporary video path (we don't necessarily need it)
@@ -583,8 +891,10 @@ def todo_generate_glb(
             if not infer_result["success"]:
                 return {
                     "glb_path": None,
+                    "glb_url": None,
+                    "glb_object_key": None,
                     "success": False,
-                    "error": f"Inference step failed: {infer_result['error']}",
+                    "error": f"Inference failed: {infer_result['error']}",
                     "key": effective_key,
                 }
 
@@ -599,13 +909,35 @@ def todo_generate_glb(
         if not convert_result["success"]:
             return {
                 "glb_path": None,
+                "glb_url": None,
+                "glb_object_key": None,
                 "success": False,
                 "error": convert_result["error"],
                 "key": effective_key,
             }
 
+        # Upload GLB to S3
+        print("[todo_generate_glb] Uploading GLB to S3...")
+        s3_result = _upload_glb_to_s3(
+            local_path=convert_result["glb_path"],
+            project_id=project_id,
+        )
+
+        if not s3_result["success"]:
+            return {
+                "glb_path": convert_result["glb_path"],
+                "glb_url": None,
+                "glb_object_key": None,
+                "success": False,
+                "error": f"S3 upload failed: {s3_result['error']}",
+                "key": effective_key,
+            }
+
+        print("[todo_generate_glb] GLB generation complete")
         return {
             "glb_path": convert_result["glb_path"],
+            "glb_url": s3_result["presigned_url"],
+            "glb_object_key": s3_result["object_key"],
             "success": True,
             "error": None,
             "key": effective_key,
@@ -614,6 +946,8 @@ def todo_generate_glb(
     except Exception as e:
         return {
             "glb_path": None,
+            "glb_url": None,
+            "glb_object_key": None,
             "success": False,
             "error": f"GLB generation failed: {str(e)}",
             "key": job_key,
@@ -726,4 +1060,3 @@ def validate_image_paths(image_paths: List[str]) -> Dict[str, Any]:
         "invalid_paths": [],
         "error": None,
     }
-

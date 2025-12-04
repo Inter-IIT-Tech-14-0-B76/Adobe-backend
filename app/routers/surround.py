@@ -187,6 +187,8 @@ async def create_surround_project(
 
         # Update the project with video info
         video_path = result.get("video_path")
+        video_url = result.get("video_url")
+        video_object_key = result.get("video_object_key")
         job_key = result.get("key")
         project_3d.add_to_history(prompt=None, video_path=video_path, job_key=job_key)
 
@@ -197,7 +199,8 @@ async def create_surround_project(
 
         return {
             "id": project_3d.id,
-            "video_path": video_path,
+            "video_url": video_url,
+            "video_object_key": video_object_key,
             "job_key": job_key,
             "images": project_3d.get_images(),
             "generation_count": project_3d.generation_count,
@@ -309,6 +312,8 @@ async def update_with_prompt(
 
         # Update the project with new video info
         video_path = result.get("video_path")
+        video_url = result.get("video_url")
+        video_object_key = result.get("video_object_key")
         job_key = result.get("key")
         project_3d.add_to_history(prompt=prompt, video_path=video_path, job_key=job_key)
 
@@ -319,7 +324,8 @@ async def update_with_prompt(
 
         return {
             "id": project_3d.id,
-            "video_path": video_path,
+            "video_url": video_url,
+            "video_object_key": video_object_key,
             "job_key": job_key,
             "images_used": result.get("images_used"),
             "prompt_applied": result.get("prompt_applied"),
@@ -347,15 +353,15 @@ async def update_with_prompt(
     Uses the latest state (images + prompt) associated with the ID
     via todo_generate_glb().
 
+    Returns a JSON response with S3 presigned URL for the GLB file.
     The ID must match a previously created 3D project.
     """,
-    response_class=FileResponse,
 )
 async def get_glb_file(
     surround_id: str,
     token_payload: Dict = Depends(verify_firebase_token),
     session: AsyncSession = Depends(async_session),
-):
+) -> Dict:
     """
     Get or generate the GLB file for a 3D project.
 
@@ -365,7 +371,7 @@ async def get_glb_file(
         session: Database session.
 
     Returns:
-        FileResponse: The GLB file as a binary download.
+        Dict with glb_url (S3 presigned URL) for frontend access.
 
     Raises:
         HTTPException: If ID not found, auth fails, or generation error.
@@ -389,17 +395,7 @@ async def get_glb_file(
         if project and project.user_id != user.id:
             raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # Check if GLB already exists
-    if project_3d.glb_file_path:
-        glb_path = Path(project_3d.glb_file_path)
-        if glb_path.exists():
-            return FileResponse(
-                path=str(glb_path),
-                filename=f"{surround_id}.glb",
-                media_type="model/gltf-binary",
-            )
-
-    # Generate GLB if it doesn't exist
+    # Generate GLB (always regenerate to get fresh S3 URL)
     image_paths = project_3d.get_images()
     job_key = project_3d.latest_job_key
 
@@ -428,15 +424,19 @@ async def get_glb_file(
 
     # Update the project with GLB path
     glb_path = result.get("glb_path")
+    glb_url = result.get("glb_url")
+    glb_object_key = result.get("glb_object_key")
     project_3d.glb_file_path = glb_path
     session.add(project_3d)
     await session.commit()
 
-    return FileResponse(
-        path=glb_path,
-        filename=f"{surround_id}.glb",
-        media_type="model/gltf-binary",
-    )
+    return {
+        "id": surround_id,
+        "glb_url": glb_url,
+        "glb_object_key": glb_object_key,
+        "job_key": job_key,
+        "message": "GLB file generated successfully",
+    }
 
 
 @surround_router.get(
@@ -588,7 +588,6 @@ async def generate_video_from_images(
     "/surround/glb/{project_id}",
     summary="[Legacy] Get GLB by project ID",
     description="Legacy endpoint. Use GET /surround/{id}/glb instead.",
-    response_class=FileResponse,
 )
 async def get_glb_by_project_id(
     project_id: str,
