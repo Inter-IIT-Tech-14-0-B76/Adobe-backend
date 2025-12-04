@@ -2,24 +2,43 @@
 Helper functions for 3D object visualization and surround view processing.
 
 This module provides utility functions for the conversational 3D workflow:
-- todo_generate_video: Initial video generation from 4 images
+- todo_generate_video: Initial video generation from 4 images via /infer API
 - todo_generate_video_from_prompt: Update video based on prompt and images
-- todo_generate_glb: Generate GLB file from current state
+- todo_generate_glb: Generate GLB file via /convert API
 
 Storage locations:
 - GLB files: /workspace/backend/glb/
 - Demo videos: /workspace/backend/demo_videos/
+
+External APIs:
+- INFER_HOST: Generates MP4 video from 4 input images
+- CONVERT_HOST: Converts to GLB format using the job key
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import requests
+
 # Storage directories for 3D assets
 GLB_STORAGE_DIR = Path("/workspace/backend/glb")
 DEMO_VIDEO_STORAGE_DIR = Path("/workspace/backend/demo_videos")
+
+# External API endpoints for 3D generation
+INFER_HOST = os.getenv(
+    "LGM_INFER_URL", "https://unpj0fg9si7yet-7860.proxy.runpod.net/infer"
+)
+CONVERT_HOST = os.getenv(
+    "LGM_CONVERT_URL", "https://unpj0fg9si7yet-7860.proxy.runpod.net/convert"
+)
+
+# Timeout settings (in seconds)
+INFER_TIMEOUT = 1200  # 20 minutes for video generation
+CONVERT_TIMEOUT = 1800  # 30 minutes for GLB conversion
 
 
 class SurroundProcessingError(Exception):
@@ -44,7 +63,7 @@ def generate_glb_path(project_id: str, filename: Optional[str] = None) -> str:
 
     Args:
         project_id: The project ID to associate with the GLB file.
-        filename: Optional custom filename. If not provided, a UUID-based name is used.
+        filename: Optional custom filename. If not provided, a UUID-based name.
 
     Returns:
         The full path where the GLB file should be stored.
@@ -52,7 +71,7 @@ def generate_glb_path(project_id: str, filename: Optional[str] = None) -> str:
     ensure_storage_directories()
 
     if filename is None:
-        filename = f"{project_id}_{uuid.uuid4().hex}.glb"
+        filename = f"{project_id}_{uuid.uuid4().hex[:8]}.glb"
     elif not filename.endswith(".glb"):
         filename = f"{filename}.glb"
 
@@ -70,7 +89,7 @@ def generate_video_path(
     Args:
         project_id: The project ID to associate with the video file.
         generation_number: Optional generation number for versioning.
-        filename: Optional custom filename. If not provided, a UUID-based name is used.
+        filename: Optional custom filename. If not provided, a UUID-based name.
 
     Returns:
         The full path where the video file should be stored.
@@ -86,15 +105,204 @@ def generate_video_path(
     return str(DEMO_VIDEO_STORAGE_DIR / filename)
 
 
+def _call_infer_api(
+    image_paths: List[str],
+    key: str,
+    output_mp4_path: str,
+) -> Dict[str, Any]:
+    """
+    Call the /infer API to generate a video from 4 input images.
+
+    Args:
+        image_paths: List of 4 image file paths (view0, view1, view2, view3).
+        key: Unique key for this job (used later for /convert).
+        output_mp4_path: Path where the output MP4 should be saved.
+
+    Returns:
+        Dict containing:
+            - success: Boolean indicating if the API call succeeded
+            - error: Error message if failed (None on success)
+            - video_path: Path to saved video (same as output_mp4_path)
+    """
+    # Validate we have exactly 4 images
+    if len(image_paths) < 4:
+        return {
+            "success": False,
+            "error": f"4 images required, got {len(image_paths)}",
+            "video_path": None,
+        }
+
+    # Verify all image files exist
+    for i, img_path in enumerate(image_paths[:4]):
+        if not Path(img_path).exists():
+            return {
+                "success": False,
+                "error": f"Image file not found: {img_path}",
+                "video_path": None,
+            }
+
+    # Prepare multipart files for the request
+    files = []
+    file_handles = []
+    try:
+        for i in range(4):
+            img_path = image_paths[i]
+            # Open file and keep handle for cleanup
+            fh = open(img_path, "rb")
+            file_handles.append(fh)
+            # Use view0, view1, view2, view3 as field names
+            files.append((f"view{i}", (f"view{i}.png", fh, "image/png")))
+
+        print(f"[INFER] POST {INFER_HOST}")
+        print(f"[INFER] key = {key}")
+        print(f"[INFER] images = {image_paths[:4]}")
+
+        # Make the API request
+        response = requests.post(
+            INFER_HOST,
+            data={"key": key},
+            files=files,
+            timeout=INFER_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            error_msg = f"/infer returned status {response.status_code}"
+            try:
+                error_detail = response.json()
+                error_msg += f": {error_detail}"
+            except Exception:
+                error_msg += f": {response.text[:500]}"
+            return {
+                "success": False,
+                "error": error_msg,
+                "video_path": None,
+            }
+
+        # Save the MP4 response
+        ensure_storage_directories()
+        with open(output_mp4_path, "wb") as f:
+            f.write(response.content)
+
+        print(f"[INFER] Saved MP4 to {output_mp4_path}")
+
+        return {
+            "success": True,
+            "error": None,
+            "video_path": output_mp4_path,
+        }
+
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "error": f"/infer request timed out after {INFER_TIMEOUT}s",
+            "video_path": None,
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "success": False,
+            "error": f"/infer HTTP error: {str(e)}",
+            "video_path": None,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"/infer unexpected error: {str(e)}",
+            "video_path": None,
+        }
+    finally:
+        # Close all file handles
+        for fh in file_handles:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+
+def _call_convert_api(
+    key: str,
+    output_glb_path: str,
+) -> Dict[str, Any]:
+    """
+    Call the /convert API to generate a GLB from a previously processed job.
+
+    The /convert endpoint uses the key from a prior /infer call to retrieve
+    the PLY data and convert it to GLB format.
+
+    Args:
+        key: The unique key used in the prior /infer call.
+        output_glb_path: Path where the output GLB should be saved.
+
+    Returns:
+        Dict containing:
+            - success: Boolean indicating if the API call succeeded
+            - error: Error message if failed (None on success)
+            - glb_path: Path to saved GLB (same as output_glb_path)
+    """
+    try:
+        print(f"[CONVERT] POST {CONVERT_HOST}")
+        print(f"[CONVERT] key = {key}")
+
+        response = requests.post(
+            CONVERT_HOST,
+            data={"key": key},
+            timeout=CONVERT_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            error_msg = f"/convert returned status {response.status_code}"
+            try:
+                error_detail = response.json()
+                error_msg += f": {error_detail}"
+            except Exception:
+                error_msg += f": {response.text[:500]}"
+            return {
+                "success": False,
+                "error": error_msg,
+                "glb_path": None,
+            }
+
+        # Save the GLB response
+        ensure_storage_directories()
+        with open(output_glb_path, "wb") as f:
+            f.write(response.content)
+
+        print(f"[CONVERT] Saved GLB to {output_glb_path}")
+
+        return {
+            "success": True,
+            "error": None,
+            "glb_path": output_glb_path,
+        }
+
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "error": f"/convert request timed out after {CONVERT_TIMEOUT}s",
+            "glb_path": None,
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "success": False,
+            "error": f"/convert HTTP error: {str(e)}",
+            "glb_path": None,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"/convert unexpected error: {str(e)}",
+            "glb_path": None,
+        }
+
+
 def todo_generate_video(
     image_paths: List[str],
     project_id: str,
 ) -> Dict[str, Any]:
     """
-    Generate initial video from 4 input images.
+    Generate initial video from 4 input images by calling the /infer API.
 
     This is the first step in the conversational workflow. User uploads 4 images
-    and an initial video is generated.
+    and an initial video is generated via the external LGM inference service.
 
     Args:
         image_paths: List of paths to input images (expects 4 images).
@@ -106,10 +314,11 @@ def todo_generate_video(
             - success: Boolean indicating if processing succeeded
             - error: Error message if processing failed (None on success)
             - generation_number: The generation number (1 for initial)
+            - key: The job key used (needed for GLB conversion)
 
     Example:
         >>> result = todo_generate_video(
-        ...     image_paths=["/path/img1.jpg", "/path/img2.jpg", "/path/img3.jpg", "/path/img4.jpg"],
+        ...     image_paths=["view0.png", "view1.png", "view2.png", "view3.png"],
         ...     project_id="abc123"
         ... )
         >>> print(result["video_path"])
@@ -119,31 +328,45 @@ def todo_generate_video(
         return {
             "video_path": None,
             "success": False,
-            "error": f"4 images are required for initial video generation, got {len(image_paths)}",
+            "error": f"4 images required for video generation, got {len(image_paths)}",
             "generation_number": 0,
+            "key": None,
         }
 
     try:
+        # Generate unique key for this job (used for both /infer and /convert)
+        job_key = f"{project_id}_gen1_{uuid.uuid4().hex[:8]}"
+
         # Generate the output video path
         video_path = generate_video_path(project_id, generation_number=1)
 
-        # TODO: Replace with actual video generation logic
-        # This is a dummy implementation that creates an empty file as placeholder
-        ensure_storage_directories()
+        print(f"[todo_generate_video] Starting video generation")
+        print(f"[todo_generate_video] Project ID: {project_id}")
+        print(f"[todo_generate_video] Job key: {job_key}")
+        print(f"[todo_generate_video] Image paths: {image_paths[:4]}")
 
-        # Create a placeholder file (to be replaced with actual processing)
-        # In production, this would call your video generation pipeline
-        Path(video_path).touch()
+        # Call the /infer API
+        result = _call_infer_api(
+            image_paths=image_paths[:4],
+            key=job_key,
+            output_mp4_path=video_path,
+        )
 
-        print(f"[TODO] todo_generate_video called with {len(image_paths)} images")
-        print(f"[TODO] Image paths: {image_paths}")
-        print(f"[TODO] Generated video path: {video_path}")
+        if not result["success"]:
+            return {
+                "video_path": None,
+                "success": False,
+                "error": result["error"],
+                "generation_number": 0,
+                "key": job_key,
+            }
 
         return {
-            "video_path": video_path,
+            "video_path": result["video_path"],
             "success": True,
             "error": None,
             "generation_number": 1,
+            "key": job_key,
         }
 
     except Exception as e:
@@ -152,6 +375,7 @@ def todo_generate_video(
             "success": False,
             "error": f"Video generation failed: {str(e)}",
             "generation_number": 0,
+            "key": None,
         }
 
 
@@ -167,6 +391,7 @@ def todo_generate_video_from_prompt(
 
     This is used for subsequent updates in the conversational workflow.
     If no new images are provided, the original images are used.
+    Calls the /infer API with the selected images.
 
     Args:
         original_images: List of original image paths stored for this project.
@@ -183,26 +408,30 @@ def todo_generate_video_from_prompt(
             - generation_number: The new generation number
             - images_used: List of image paths that were used
             - prompt_applied: The prompt that was applied
+            - key: The job key used (needed for GLB conversion)
 
     Example:
         >>> result = todo_generate_video_from_prompt(
-        ...     original_images=["/path/img1.jpg", "/path/img2.jpg", "/path/img3.jpg", "/path/img4.jpg"],
+        ...     original_images=["v0.png", "v1.png", "v2.png", "v3.png"],
         ...     prompt="Make it look more futuristic",
         ...     project_id="abc123",
-        ...     generation_number=2
+        ...     generation_number=1
         ... )
     """
     # Determine which images to use
-    images_to_use = new_images if new_images and len(new_images) > 0 else original_images
+    images_to_use = (
+        new_images if new_images and len(new_images) >= 4 else original_images
+    )
 
-    if not images_to_use:
+    if not images_to_use or len(images_to_use) < 4:
         return {
             "video_path": None,
             "success": False,
-            "error": "No images available for video generation",
+            "error": "4 images required for video generation",
             "generation_number": generation_number,
-            "images_used": [],
+            "images_used": images_to_use or [],
             "prompt_applied": prompt,
+            "key": None,
         }
 
     if not prompt:
@@ -213,35 +442,56 @@ def todo_generate_video_from_prompt(
             "generation_number": generation_number,
             "images_used": images_to_use,
             "prompt_applied": None,
+            "key": None,
         }
 
     try:
         new_gen_number = generation_number + 1
         effective_project_id = project_id or uuid.uuid4().hex
 
+        # Generate unique key for this job
+        job_key = f"{effective_project_id}_gen{new_gen_number}_{uuid.uuid4().hex[:8]}"
+
         # Generate the output video path
-        video_path = generate_video_path(effective_project_id, generation_number=new_gen_number)
+        video_path = generate_video_path(
+            effective_project_id, generation_number=new_gen_number
+        )
 
-        # TODO: Replace with actual prompt-based video generation logic
-        # This is a dummy implementation
-        ensure_storage_directories()
+        print(f"[todo_generate_video_from_prompt] Starting video generation")
+        print(f"[todo_generate_video_from_prompt] Prompt: {prompt}")
+        print(f"[todo_generate_video_from_prompt] Job key: {job_key}")
+        print(f"[todo_generate_video_from_prompt] Images: {images_to_use[:4]}")
+        print(f"[todo_generate_video_from_prompt] Generation: {new_gen_number}")
 
-        # Create a placeholder file (to be replaced with actual processing)
-        Path(video_path).touch()
+        # Call the /infer API
+        # Note: The prompt is stored for reference but the current /infer API
+        # doesn't use text prompts - it generates from images only.
+        # Future enhancement: pass prompt to a different endpoint if available.
+        result = _call_infer_api(
+            image_paths=images_to_use[:4],
+            key=job_key,
+            output_mp4_path=video_path,
+        )
 
-        print(f"[TODO] todo_generate_video_from_prompt called")
-        print(f"[TODO] Prompt: {prompt}")
-        print(f"[TODO] Images used: {images_to_use}")
-        print(f"[TODO] Generation number: {new_gen_number}")
-        print(f"[TODO] Generated video path: {video_path}")
+        if not result["success"]:
+            return {
+                "video_path": None,
+                "success": False,
+                "error": result["error"],
+                "generation_number": generation_number,
+                "images_used": images_to_use[:4],
+                "prompt_applied": prompt,
+                "key": job_key,
+            }
 
         return {
-            "video_path": video_path,
+            "video_path": result["video_path"],
             "success": True,
             "error": None,
             "generation_number": new_gen_number,
-            "images_used": images_to_use,
+            "images_used": images_to_use[:4],
             "prompt_applied": prompt,
+            "key": job_key,
         }
 
     except Exception as e:
@@ -250,8 +500,9 @@ def todo_generate_video_from_prompt(
             "success": False,
             "error": f"Prompt-based video generation failed: {str(e)}",
             "generation_number": generation_number,
-            "images_used": images_to_use,
+            "images_used": images_to_use[:4] if images_to_use else [],
             "prompt_applied": prompt,
+            "key": None,
         }
 
 
@@ -259,61 +510,105 @@ def todo_generate_glb(
     project_id: str,
     image_paths: List[str],
     latest_prompt: Optional[str] = None,
+    job_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Generate GLB 3D model file from the current project state.
+    Generate GLB 3D model file by calling the /convert API.
 
-    Uses the latest images and prompt associated with the project ID
-    to generate a GLB file for 3D visualization.
+    If a job_key is provided (from a prior video generation), it uses that key
+    to convert the existing PLY to GLB. Otherwise, it first calls /infer to
+    generate the 3D data, then calls /convert.
 
     Args:
         project_id: The project ID to generate GLB for.
         image_paths: List of image paths to use for GLB generation.
-        latest_prompt: Optional latest prompt to influence GLB generation.
+        latest_prompt: Optional latest prompt (for reference/logging).
+        job_key: Optional key from prior /infer call (skips re-inference).
 
     Returns:
         Dict containing:
             - glb_path: Path to the generated GLB file
             - success: Boolean indicating if processing succeeded
             - error: Error message if processing failed (None on success)
+            - key: The job key used
 
     Example:
         >>> result = todo_generate_glb(
         ...     project_id="abc123",
-        ...     image_paths=["/path/img1.jpg", "/path/img2.jpg", "/path/img3.jpg", "/path/img4.jpg"],
-        ...     latest_prompt="Futuristic style"
+        ...     image_paths=["v0.png", "v1.png", "v2.png", "v3.png"],
+        ...     job_key="abc123_gen1_12345678"
         ... )
         >>> print(result["glb_path"])
         /workspace/backend/glb/abc123_a1b2c3d4.glb
     """
-    if not image_paths:
-        return {
-            "glb_path": None,
-            "success": False,
-            "error": "No images available for GLB generation",
-        }
+    if not image_paths or len(image_paths) < 4:
+        # If we have a job_key, we can still try to convert
+        if not job_key:
+            return {
+                "glb_path": None,
+                "success": False,
+                "error": "4 images required for GLB generation (or provide job_key)",
+                "key": None,
+            }
 
     try:
         # Generate the output GLB path
         glb_path = generate_glb_path(project_id)
 
-        # TODO: Replace with actual GLB generation logic
-        # This is a dummy implementation
-        ensure_storage_directories()
+        print(f"[todo_generate_glb] Starting GLB generation")
+        print(f"[todo_generate_glb] Project ID: {project_id}")
+        print(f"[todo_generate_glb] Latest prompt: {latest_prompt}")
 
-        # Create a placeholder file (to be replaced with actual processing)
-        Path(glb_path).touch()
+        # Determine the key to use for /convert
+        effective_key = job_key
 
-        print(f"[TODO] todo_generate_glb called")
-        print(f"[TODO] Project ID: {project_id}")
-        print(f"[TODO] Image paths: {image_paths}")
-        print(f"[TODO] Latest prompt: {latest_prompt}")
-        print(f"[TODO] Generated GLB path: {glb_path}")
+        # If no job_key provided, we need to run /infer first
+        if not effective_key:
+            effective_key = f"{project_id}_glb_{uuid.uuid4().hex[:8]}"
+
+            print(f"[todo_generate_glb] No job_key, running /infer first")
+            print(f"[todo_generate_glb] New key: {effective_key}")
+
+            # Generate a temporary video path (we don't necessarily need it)
+            temp_video_path = generate_video_path(
+                project_id, filename=f"temp_{effective_key}"
+            )
+
+            infer_result = _call_infer_api(
+                image_paths=image_paths[:4],
+                key=effective_key,
+                output_mp4_path=temp_video_path,
+            )
+
+            if not infer_result["success"]:
+                return {
+                    "glb_path": None,
+                    "success": False,
+                    "error": f"Inference step failed: {infer_result['error']}",
+                    "key": effective_key,
+                }
+
+        print(f"[todo_generate_glb] Calling /convert with key: {effective_key}")
+
+        # Call the /convert API
+        convert_result = _call_convert_api(
+            key=effective_key,
+            output_glb_path=glb_path,
+        )
+
+        if not convert_result["success"]:
+            return {
+                "glb_path": None,
+                "success": False,
+                "error": convert_result["error"],
+                "key": effective_key,
+            }
 
         return {
-            "glb_path": glb_path,
+            "glb_path": convert_result["glb_path"],
             "success": True,
             "error": None,
+            "key": effective_key,
         }
 
     except Exception as e:
@@ -321,6 +616,7 @@ def todo_generate_glb(
             "glb_path": None,
             "success": False,
             "error": f"GLB generation failed: {str(e)}",
+            "key": job_key,
         }
 
 
@@ -430,3 +726,4 @@ def validate_image_paths(image_paths: List[str]) -> Dict[str, Any]:
         "invalid_paths": [],
         "error": None,
     }
+

@@ -558,7 +558,10 @@ def _run_comfy_pipeline(
             "image2": image_paths[1],
         }
         primary_image = image_paths[0]
-        debug_print(f"Using comfy-remix: image1={image_paths[0]}, image2={image_paths[1]}", "INFO")
+        debug_print(
+            f"Using comfy-remix: image1={image_paths[0]}, image2={image_paths[1]}",
+            "INFO",
+        )
     else:
         # Use comfy-edit for single image
         tool = "comfy-edit"
@@ -761,7 +764,9 @@ def run_ai_editing_pipeline(
                 )
         elif tool == "default" or tool == "default_mode":
             # "default" classification -> use ComfyUI pipeline based on image count
-            debug_print("Classification is 'default' - routing to ComfyUI pipeline", "INFO")
+            debug_print(
+                "Classification is 'default' - routing to ComfyUI pipeline", "INFO"
+            )
             return _run_comfy_pipeline(
                 image_paths=image_paths,
                 prompt=user_prompt,
@@ -1114,7 +1119,7 @@ def execute_tool(tool, image_path, prompt, params, ai_suggestions):
 
     tool_endpoints = {
         "style-transfer-text": "/style-transfer/text",
-        "style-transfer-ref": "/style-transfer/ref",
+        "style_transfer_ref": "/style-transfer/ref",
         "color-grading": "/color-grading",
         "segmentation": "/sam/segment",
         "comfy-edit": "/comfy/edit",

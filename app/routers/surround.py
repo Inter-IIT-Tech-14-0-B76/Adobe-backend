@@ -140,9 +140,7 @@ async def create_surround_project(
         HTTPException: If auth fails, wrong file count, or processing error.
     """
     # Authenticate user
-    user = await upsert_user_from_token(
-        token_payload, session, set_last_login=True
-    )
+    user = await upsert_user_from_token(token_payload, session, set_last_login=True)
     if not user:
         raise HTTPException(status_code=401, detail="User invalid")
 
@@ -189,7 +187,8 @@ async def create_surround_project(
 
         # Update the project with video info
         video_path = result.get("video_path")
-        project_3d.add_to_history(prompt=None, video_path=video_path)
+        job_key = result.get("key")
+        project_3d.add_to_history(prompt=None, video_path=video_path, job_key=job_key)
 
         # Save to database
         session.add(project_3d)
@@ -199,6 +198,7 @@ async def create_surround_project(
         return {
             "id": project_3d.id,
             "video_path": video_path,
+            "job_key": job_key,
             "images": project_3d.get_images(),
             "generation_count": project_3d.generation_count,
             "project_3d": project_3d.public_dict(),
@@ -260,9 +260,7 @@ async def update_with_prompt(
         HTTPException: If ID not found, auth fails, or processing error.
     """
     # Authenticate user
-    user = await upsert_user_from_token(
-        token_payload, session, set_last_login=True
-    )
+    user = await upsert_user_from_token(token_payload, session, set_last_login=True)
     if not user:
         raise HTTPException(status_code=401, detail="User invalid")
 
@@ -311,7 +309,8 @@ async def update_with_prompt(
 
         # Update the project with new video info
         video_path = result.get("video_path")
-        project_3d.add_to_history(prompt=prompt, video_path=video_path)
+        job_key = result.get("key")
+        project_3d.add_to_history(prompt=prompt, video_path=video_path, job_key=job_key)
 
         # Save to database
         session.add(project_3d)
@@ -321,6 +320,7 @@ async def update_with_prompt(
         return {
             "id": project_3d.id,
             "video_path": video_path,
+            "job_key": job_key,
             "images_used": result.get("images_used"),
             "prompt_applied": result.get("prompt_applied"),
             "generation_count": int(project_3d.generation_count),
@@ -371,9 +371,7 @@ async def get_glb_file(
         HTTPException: If ID not found, auth fails, or generation error.
     """
     # Authenticate user
-    user = await upsert_user_from_token(
-        token_payload, session, set_last_login=True
-    )
+    user = await upsert_user_from_token(token_payload, session, set_last_login=True)
     if not user:
         raise HTTPException(status_code=401, detail="User invalid")
 
@@ -403,18 +401,22 @@ async def get_glb_file(
 
     # Generate GLB if it doesn't exist
     image_paths = project_3d.get_images()
-    if not image_paths:
+    job_key = project_3d.latest_job_key
+
+    # We need either images or a job_key to generate GLB
+    if not image_paths and not job_key:
         raise HTTPException(
             status_code=400,
-            detail="No images available for GLB generation",
+            detail="No images or job key available for GLB generation",
         )
 
-    # Generate GLB using todo_generate_glb
+    # Generate GLB using todo_generate_glb (with job_key if available)
     result = await anyio.to_thread.run_sync(
         lambda: todo_generate_glb(
             project_id=project_3d.id,
             image_paths=image_paths,
             latest_prompt=project_3d.latest_prompt,
+            job_key=job_key,
         )
     )
 
@@ -469,9 +471,7 @@ async def get_surround_project(
         HTTPException: If ID not found or authentication fails.
     """
     # Authenticate user
-    user = await upsert_user_from_token(
-        token_payload, session, set_last_login=True
-    )
+    user = await upsert_user_from_token(token_payload, session, set_last_login=True)
     if not user:
         raise HTTPException(status_code=401, detail="User invalid")
 
@@ -521,9 +521,7 @@ async def get_latest_video(
         HTTPException: If ID not found, no video, or auth fails.
     """
     # Authenticate user
-    user = await upsert_user_from_token(
-        token_payload, session, set_last_login=True
-    )
+    user = await upsert_user_from_token(token_payload, session, set_last_login=True)
     if not user:
         raise HTTPException(status_code=401, detail="User invalid")
 
@@ -603,9 +601,7 @@ async def get_glb_by_project_id(
     Finds the Project3D associated with the given project ID.
     """
     # Authenticate user
-    user = await upsert_user_from_token(
-        token_payload, session, set_last_login=True
-    )
+    user = await upsert_user_from_token(token_payload, session, set_last_login=True)
     if not user:
         raise HTTPException(status_code=401, detail="User invalid")
 

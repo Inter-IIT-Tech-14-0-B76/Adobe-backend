@@ -483,6 +483,13 @@ class Project3D(SQLModel, table=True):
         description="Number of video generations performed",
     )
 
+    # Job key from latest /infer call (needed for /convert to GLB)
+    latest_job_key: Optional[str] = Field(
+        default=None,
+        sa_column=Column(String(256), nullable=True),
+        description="Job key from latest inference (used for GLB conversion)",
+    )
+
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), server_default=func.now()),
@@ -513,19 +520,27 @@ class Project3D(SQLModel, table=True):
         self.image_3 = images[2] if len(images) > 2 else None
         self.image_4 = images[3] if len(images) > 3 else None
 
-    def add_to_history(self, prompt: Optional[str], video_path: str) -> None:
+    def add_to_history(
+        self,
+        prompt: Optional[str],
+        video_path: str,
+        job_key: Optional[str] = None,
+    ) -> None:
         """Add a generation to the prompt and video history."""
         history_entry = {
             "prompt": prompt,
             "video_path": video_path,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "generation_number": self.generation_count + 1,
+            "job_key": job_key,
         }
         self.prompt_history = self.prompt_history + [history_entry]
         self.video_history = self.video_history + [video_path]
         self.generation_count = int(self.generation_count) + 1
         self.latest_prompt = prompt
         self.demo_video_path = video_path
+        if job_key:
+            self.latest_job_key = job_key
 
     def public_dict(self) -> dict:
         """Return a dictionary representation safe for API responses."""
@@ -540,6 +555,7 @@ class Project3D(SQLModel, table=True):
             "glb_file_path": self.glb_file_path,
             "demo_video_path": self.demo_video_path,
             "latest_prompt": self.latest_prompt,
+            "latest_job_key": self.latest_job_key,
             "prompt_history": self.prompt_history,
             "video_history": self.video_history,
             "generation_count": int(self.generation_count),
