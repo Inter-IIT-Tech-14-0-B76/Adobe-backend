@@ -872,7 +872,8 @@ async def get_project_versions(
         .where(VersionHistory.project_id == project_id)
         .order_by(desc(VersionHistory.created_at))
     )
-    versions = (await session.execute(statement)).all()
+    result = await session.execute(statement)
+    versions = result.scalars().all()
     return [v.public_dict() for v in versions]
 
 
