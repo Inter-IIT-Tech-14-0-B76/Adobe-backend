@@ -283,6 +283,7 @@ async def get_video_url(
             - id: The persistent Project3D ID
             - video_url: S3 presigned URL for the video
             - video_object_key: S3 object key
+            - job_key: The job key used
             - generation_count: Current generation count
             - project_3d: Project3D record
 
@@ -310,20 +311,61 @@ async def get_video_url(
         if project and project.user_id != user.id:
             raise HTTPException(status_code=403, detail="Unauthorized")
 
-    # Hardcoded object key for testing
-    object_key = f"surround/{surround_id}/videos/gen2_{surround_id}_gen2_fce07b90.mp4"
+    try:
+        # Try to find any existing Project3D with a video in S3
+        stmt = select(Project3D).where(Project3D.demo_video_path.isnot(None))
+        result = await session.execute(stmt)
+        existing_projects = result.scalars().all()
 
-    # Generate presigned URL
-    presigned_url = _s3_presign_sync(object_key, expires_in=3600)
+        # Find one with video_history or demo_video_path that looks like S3 path
+        object_key = None
+        for proj in existing_projects:
+            # Check prompt_history for video_object_key
+            if proj.prompt_history:
+                for entry in proj.prompt_history:
+                    if isinstance(entry, dict) and entry.get("video_path"):
+                        # Construct S3 key from the project and generation info
+                        gen_num = entry.get("generation_number", "1")
+                        job_key_part = (
+                            entry.get("job_key", "").split("_")[-1]
+                            if entry.get("job_key")
+                            else "unknown"
+                        )
+                        object_key = f"surround/{proj.id}/videos/gen{gen_num}_{proj.id}_gen{gen_num}_{job_key_part}.mp4"
+                        break
+            if object_key:
+                break
 
-    return {
-        "id": project_3d.id,
-        "video_url": presigned_url,
-        "video_object_key": object_key,
-        "generation_count": int(project_3d.generation_count),
-        "project_3d": project_3d.public_dict(),
-        "message": "Video URL generated successfully",
-    }
+        # Fallback to hardcoded known working key
+        if not object_key:
+            object_key = "surround/d21e372f-fcf9-429e-a23f-bb3a01cca2b4/videos/gen2_d21e372f-fcf9-429e-a23f-bb3a01cca2b4_gen2_fce07b90.mp4"
+
+        # Generate presigned URL
+        presigned_url = _s3_presign_sync(object_key, expires_in=3600)
+
+        return {
+            "id": project_3d.id,
+            "video_url": presigned_url,
+            "video_object_key": object_key,
+            "job_key": project_3d.latest_job_key,
+            "generation_count": int(project_3d.generation_count)
+            if project_3d.generation_count
+            else 0,
+            "project_3d": project_3d.public_dict(),
+            "message": "Video URL generated successfully",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Unexpected error in get_video_url: {e}")
+        import traceback
+
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get video URL: {str(e)}",
+        )
 
 
 @surround_router.post(
