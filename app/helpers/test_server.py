@@ -779,6 +779,8 @@ def run_ai_editing_pipeline(
             tool = "style-transfer-text"
         elif tool == "color_grading":
             tool = "color-grading"
+        elif tool == "manual":
+            tool = "default"
 
         debug_print(f"Detected tool: {tool}", "INFO")
         debug_print(f"Parameters: {json.dumps(params, indent=2)}", "INFO")
