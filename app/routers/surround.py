@@ -200,6 +200,7 @@ async def create_surround_project(
         except Exception as db_err:
             print(f"[CREATE] Database commit failed: {str(db_err)}")
             import traceback
+
             traceback.print_exc()
             raise HTTPException(
                 status_code=500,
@@ -228,6 +229,7 @@ async def create_surround_project(
         except Exception as resp_err:
             print(f"[CREATE] Response preparation failed: {str(resp_err)}")
             import traceback
+
             traceback.print_exc()
             # Return minimal response
             return {
@@ -244,6 +246,7 @@ async def create_surround_project(
     except Exception as e:
         print(f"[CREATE] Unexpected error: {str(e)}")
         import traceback
+
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
@@ -352,9 +355,20 @@ async def update_with_prompt(
         project_3d.add_to_history(prompt=prompt, video_path=video_path, job_key=job_key)
 
         # Save to database
-        session.add(project_3d)
-        await session.commit()
-        await session.refresh(project_3d)
+        try:
+            session.add(project_3d)
+            await session.commit()
+            await session.refresh(project_3d)
+        except Exception as db_error:
+            await session.rollback()
+            logger.error(f"Database error saving project_3d: {db_error}")
+            logger.error(
+                f"Project data: id={project_3d.id}, latest_job_key={project_3d.latest_job_key}, generation_count={project_3d.generation_count}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Database error: {str(db_error)}. Video was generated and uploaded to S3 successfully (video_url: {video_url}) but failed to save to database.",
+            )
 
         return {
             "id": project_3d.id,
@@ -371,6 +385,10 @@ async def update_with_prompt(
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Unexpected error in update_with_prompt: {e}")
+        import traceback
+
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to update video: {str(e)}",
@@ -660,3 +678,4 @@ async def get_glb_by_project_id(
         token_payload=token_payload,
         session=session,
     )
+

@@ -286,7 +286,7 @@ def apply_style_transfer_to_images(
     print(f"[STYLE] Prompt: {prompt}")
 
     for i, img_path in enumerate(image_paths):
-        print(f"[STYLE] Processing image {i+1}/{len(image_paths)}: {img_path}")
+        print(f"[STYLE] Processing image {i + 1}/{len(image_paths)}: {img_path}")
 
         result = _apply_style_transfer_to_image(
             image_path=img_path,
@@ -298,7 +298,7 @@ def apply_style_transfer_to_images(
             return {
                 "success": False,
                 "styled_paths": styled_paths,
-                "error": f"Image {i+1} failed: {result['error']}",
+                "error": f"Image {i + 1} failed: {result['error']}",
             }
 
         styled_paths.append(result["output_path"])
@@ -755,9 +755,7 @@ def todo_generate_video_from_prompt(
         print(f"[prompt_video] Styled images: {styled_images}")
 
         # Step 2: Generate unique key for this job (NEW key for styled images)
-        job_key = (
-            f"{effective_project_id}_gen{new_gen_number}_{uuid.uuid4().hex[:8]}"
-        )
+        job_key = f"{effective_project_id}_gen{new_gen_number}_{uuid.uuid4().hex[:8]}"
 
         # Generate the output video path
         video_path = generate_video_path(
