@@ -531,7 +531,7 @@ class Project3D(SQLModel, table=True):
             "prompt": prompt,
             "video_path": video_path,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "generation_number": self.generation_count + 1,
+            "generation_number": str(int(self.generation_count) + 1),
             "job_key": job_key,
         }
         self.prompt_history = self.prompt_history + [history_entry]
