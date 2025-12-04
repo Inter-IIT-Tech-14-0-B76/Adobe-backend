@@ -40,7 +40,7 @@ INFER_HOST = os.getenv(
     "LGM_INFER_URL", "https://unpj0fg9si7yet-7860.proxy.runpod.net/infer"
 )
 CONVERT_HOST = os.getenv(
-    "LGM_CONVERT_URL", "https://unpj0fg9si7yet-7860.proxy.runpod.net/convert"
+    "LGM_CONVERT_URL", "https://unpj0fg9si7yet-8888.proxy.runpod.net/convert"
 )
 
 # Timeout settings (in seconds)
