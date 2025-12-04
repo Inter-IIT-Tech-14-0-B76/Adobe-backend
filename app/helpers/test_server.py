@@ -762,6 +762,9 @@ def run_ai_editing_pipeline(
                 params["content_image"] = (
                     image_paths[1] if len(image_paths) > 1 else image_paths[0]
                 )
+        elif tool == "style_transfer_ref":
+            tool = "style-transfer-text"
+            debug_print("Classification changed to style-transfer-text")
         elif tool == "default" or tool == "default_mode":
             # "default" classification -> use ComfyUI pipeline based on image count
             debug_print(
