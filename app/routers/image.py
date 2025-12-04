@@ -25,7 +25,7 @@ from app.helpers.s3 import (
     _s3_presign_sync,
     _s3_put_object_sync,
 )
-from app.helpers.test_server import run_ai_editing_pipeline
+from app.helpers.test_server import run_ai_editing_pipeline, run_object_removal_pipeline
 from app.utils.db import async_session
 from app.utils.models import Image, ImageActionType, Project, VersionHistory
 from config import WORKSPACE_OUTPUT_DIR, WORKSPACE_SERVER
@@ -830,6 +830,193 @@ async def add_image_to_project(
                     pass
 
         return resp
+
+
+@image_router.post(
+    "/projects/{project_id}/remove-object",
+    status_code=201,
+    summary="Remove object from image at point",
+    description="""
+    Object removal pipeline using SAM2 segmentation and LaMa inpainting.
+
+    Takes the current image from the project and a point (x, y) coordinate.
+    The object at that point is segmented using SAM2, then removed using
+    LaMa inpainting. Creates a new version with the result.
+    """,
+)
+async def remove_object_at_point(
+    project_id: str,
+    token_payload: Dict = Depends(verify_firebase_token),
+    x: int = Body(..., description="X coordinate of the object to remove"),
+    y: int = Body(..., description="Y coordinate of the object to remove"),
+    session: AsyncSession = Depends(async_session),
+):
+    """
+    Remove an object from the current project image at the specified point.
+
+    Uses SAM2 for segmentation and LaMa for inpainting.
+    """
+    uploader = await upsert_user_from_token(token_payload, session, set_last_login=True)
+    if not uploader:
+        raise HTTPException(status_code=401, detail="User invalid")
+
+    project = await session.get(Project, project_id)
+    if not project or project.user_id != uploader.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    if not project.current_version_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Project has no current version. Please upload an image first.",
+        )
+
+    current_version = await session.get(VersionHistory, project.current_version_id)
+    if not current_version:
+        raise HTTPException(status_code=404, detail="Current version not found")
+
+    if not current_version.image_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Current version has no images. Please upload an image first.",
+        )
+
+    # Get the source image (last one in the version)
+    source_images = await _fetch_images_by_ids(session, current_version.image_ids)
+    if not source_images:
+        raise HTTPException(status_code=404, detail="Source images not found")
+
+    source_image = source_images[-1]
+
+    if not source_image.object_key:
+        raise HTTPException(status_code=400, detail="Source image has no S3 object key")
+
+    print(f"[INFO] Object removal for project {project_id}")
+    print(f"[INFO] Point: ({x}, {y})")
+    print(f"[INFO] Source image: {source_image.id}")
+
+    WORKSPACE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    local_input_path = WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{source_image.file_name or 'image'}"
+
+    try:
+        # Download source image from S3
+        image_bytes = await anyio.to_thread.run_sync(
+            _s3_get_object_bytes_sync, source_image.object_key
+        )
+
+        def write_file():
+            local_input_path.write_bytes(image_bytes)
+
+        await anyio.to_thread.run_sync(write_file)
+
+        # Run object removal pipeline
+        pipeline_result = await anyio.to_thread.run_sync(
+            lambda: run_object_removal_pipeline(
+                image_path=str(local_input_path),
+                x=x,
+                y=y,
+            )
+        )
+
+        if pipeline_result.get("error"):
+            print(f"[ERROR] Pipeline failed: {pipeline_result.get('error')}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Object removal failed: {pipeline_result.get('error')}",
+            )
+
+        output_image_path = pipeline_result.get("output_image_path")
+        if not output_image_path or not Path(output_image_path).exists():
+            print(f"[ERROR] No output image produced. Result: {pipeline_result}")
+            raise HTTPException(
+                status_code=500, detail="Object removal did not produce output image"
+            )
+
+        print(f"[INFO] Output image: {output_image_path}")
+
+        # Read output and upload to S3
+        def read_output():
+            return Path(output_image_path).read_bytes()
+
+        output_contents = await anyio.to_thread.run_sync(read_output)
+        output_sha256 = _compute_sha256(output_contents)
+        output_filename = Path(output_image_path).name
+        output_object_key = (
+            f"project/{project_id}/assets/{output_sha256}/{output_filename}"
+        )
+
+        await anyio.to_thread.run_sync(
+            _s3_put_object_sync, output_object_key, output_contents, "image/png"
+        )
+
+        # Create new image record
+        output_image = Image(
+            id=str(uuid4()),
+            project_id=project_id,
+            parent_image_id=source_image.id,
+            object_key=output_object_key,
+            file_name=output_filename,
+            mime_type="image/png",
+            sha256_hash=output_sha256,
+            action_type=ImageActionType.GENERATE,
+            is_virtual=False,
+            transformations={},
+            generation_params={
+                "pipeline": "object_removal",
+                "point": {"x": x, "y": y},
+                "mask_path": pipeline_result.get("mask_path"),
+            },
+        )
+        session.add(output_image)
+        await session.flush()
+
+        # Create new version
+        new_version = VersionHistory(
+            id=str(uuid4()),
+            project_id=project_id,
+            parent_id=current_version.id,
+            image_ids=[output_image.id],
+            prompt=f"Remove object at ({x}, {y})",
+            output_logs=f"Object removed at point ({x}, {y})",
+        )
+        session.add(new_version)
+        await session.flush()
+
+        project.current_version_id = new_version.id
+        session.add(project)
+
+        # Cleanup local files
+        if local_input_path.exists():
+            def delete_input():
+                local_input_path.unlink()
+            await anyio.to_thread.run_sync(delete_input)
+
+        await session.commit()
+        await session.refresh(new_version)
+
+        resp = new_version.public_dict()
+        resp["images"] = []
+        img_dict = output_image.public_dict()
+        img_dict["presigned_url"] = _s3_presign_sync(output_image.object_key)
+        resp["images"].append(img_dict)
+        resp["mask_path"] = pipeline_result.get("mask_path")
+        resp["segmentation_output"] = pipeline_result.get("segmentation_output")
+
+        print(f"[INFO] Successfully created version {new_version.id}")
+        return resp
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Pipeline exception: {str(e)}")
+        # Cleanup on error
+        if local_input_path.exists():
+            try:
+                def delete_file():
+                    local_input_path.unlink()
+                await anyio.to_thread.run_sync(delete_file)
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=f"Object removal error: {str(e)}")
 
 
 @image_router.post(

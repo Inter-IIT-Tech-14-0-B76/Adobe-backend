@@ -818,6 +818,272 @@ def run_ai_editing_pipeline(
         return {"error": error_msg}
 
 
+# =============================================================================
+# OBJECT REMOVAL PIPELINE
+# =============================================================================
+
+
+def run_sam_segmentation(
+    image_path: str,
+    x: int,
+    y: int,
+    output_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Run SAM2 segmentation on an image at a specific point.
+
+    Args:
+        image_path: Path to the input image
+        x: X coordinate of the point to segment
+        y: Y coordinate of the point to segment
+        output_dir: Optional output directory for segmentation results
+
+    Returns:
+        Dict with 'mask' and 'output' paths, or 'error' key if failed
+    """
+    debug_print("=" * 60, "INFO")
+    debug_print("RUNNING SAM SEGMENTATION", "INFO")
+    debug_print("=" * 60, "INFO")
+    debug_print(f"Image: {image_path}", "INFO")
+    debug_print(f"Point: ({x}, {y})", "INFO")
+
+    if output_dir is None:
+        output_dir = str(WORKSPACE_OUTPUT_DIR / "segmentation")
+
+    try:
+        url = f"{WORKSPACE_SERVER}/sam/segment"
+        payload = {
+            "image": image_path,
+            "x": x,
+            "y": y,
+            "output_dir": output_dir,
+        }
+
+        debug_print(f"POST {url}", "REQUEST")
+        debug_print(f"Payload: {json.dumps(payload, indent=2)}", "REQUEST")
+
+        response = requests.post(url, json=payload, timeout=120)
+
+        debug_print(f"Response status: {response.status_code}", "RESPONSE")
+
+        if response.status_code != 200:
+            error_msg = f"SAM segmentation failed with status {response.status_code}"
+            debug_print(error_msg, "ERROR")
+            debug_print(f"Response: {response.text}", "ERROR")
+            return {"error": error_msg, "response": response.text}
+
+        result = response.json()
+        debug_print(f"SAM result: {json.dumps(result, indent=2)}", "RESPONSE")
+
+        if result.get("error"):
+            return {"error": result.get("error")}
+
+        return result
+
+    except requests.exceptions.Timeout:
+        error_msg = "SAM segmentation request timed out"
+        debug_print(error_msg, "ERROR")
+        return {"error": error_msg}
+    except Exception as e:
+        error_msg = f"SAM segmentation error: {str(e)}"
+        debug_print(error_msg, "ERROR")
+        traceback.print_exc()
+        return {"error": error_msg}
+
+
+def run_inpaint_removal(
+    image_path: str,
+    mask_path: str,
+) -> Dict[str, Any]:
+    """
+    Run LaMa inpainting to remove objects from an image using a mask.
+
+    Args:
+        image_path: Path to the input image
+        mask_path: Path to the mask image (white areas will be inpainted)
+
+    Returns:
+        Dict with 'output_images' list, or 'error' key if failed
+    """
+    debug_print("=" * 60, "INFO")
+    debug_print("RUNNING INPAINT REMOVAL", "INFO")
+    debug_print("=" * 60, "INFO")
+    debug_print(f"Image: {image_path}", "INFO")
+    debug_print(f"Mask: {mask_path}", "INFO")
+
+    try:
+        url = f"{WORKSPACE_SERVER}/comfy/inpaint"
+        payload = {
+            "image": image_path,
+            "mask": mask_path,
+        }
+
+        debug_print(f"POST {url}", "REQUEST")
+        debug_print(f"Payload: {json.dumps(payload, indent=2)}", "REQUEST")
+
+        response = requests.post(url, json=payload, timeout=300)
+
+        debug_print(f"Response status: {response.status_code}", "RESPONSE")
+
+        if response.status_code != 200:
+            error_msg = f"Inpaint removal failed with status {response.status_code}"
+            debug_print(error_msg, "ERROR")
+            debug_print(f"Response: {response.text}", "ERROR")
+            return {"error": error_msg, "response": response.text}
+
+        result = response.json()
+        debug_print(f"Inpaint result: {json.dumps(result, indent=2)}", "RESPONSE")
+
+        if result.get("error"):
+            return {"error": result.get("error")}
+
+        # Extract output path
+        output_images = result.get("output_images", [])
+        if output_images:
+            result["output_image_path"] = output_images[0]
+            debug_print(f"Output image: {output_images[0]}", "INFO")
+
+        return result
+
+    except requests.exceptions.Timeout:
+        error_msg = "Inpaint removal request timed out"
+        debug_print(error_msg, "ERROR")
+        return {"error": error_msg}
+    except Exception as e:
+        error_msg = f"Inpaint removal error: {str(e)}"
+        debug_print(error_msg, "ERROR")
+        traceback.print_exc()
+        return {"error": error_msg}
+
+
+def run_object_removal_pipeline(
+    image_path: str,
+    x: int,
+    y: int,
+    output_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Complete object removal pipeline: SAM Segmentation -> LaMa Inpainting.
+
+    Takes an image and a point (x, y), segments the object at that point
+    using SAM2, then removes the segmented object using LaMa inpainting.
+
+    Args:
+        image_path: Path to the input image
+        x: X coordinate of the object to remove
+        y: Y coordinate of the object to remove
+        output_dir: Optional output directory for intermediate files
+
+    Returns:
+        Dict with:
+            - 'output_image_path': Path to the final inpainted image
+            - 'mask_path': Path to the segmentation mask
+            - 'segmentation_output': Path to the segmentation visualization
+            - 'error': Error message if pipeline failed
+    """
+    debug_print("=" * 60, "INFO")
+    debug_print("STARTING OBJECT REMOVAL PIPELINE", "INFO")
+    debug_print("=" * 60, "INFO")
+    debug_print(f"Image: {image_path}", "INFO")
+    debug_print(f"Target point: ({x}, {y})", "INFO")
+
+    if output_dir is None:
+        output_dir = str(WORKSPACE_OUTPUT_DIR / "object_removal")
+
+    # Step 1: SAM Segmentation
+    debug_print("\n[STEP 1/2] Running SAM segmentation...", "INFO")
+    sam_result = run_sam_segmentation(
+        image_path=image_path,
+        x=x,
+        y=y,
+        output_dir=output_dir,
+    )
+
+    if sam_result.get("error"):
+        error_msg = f"SAM segmentation failed: {sam_result.get('error')}"
+        debug_print(error_msg, "ERROR")
+        return {"error": error_msg}
+
+    mask_path = sam_result.get("mask")
+    segmentation_output = sam_result.get("output")
+
+    if not mask_path:
+        error_msg = "SAM segmentation did not produce a mask"
+        debug_print(error_msg, "ERROR")
+        return {"error": error_msg}
+
+    debug_print(f"Segmentation mask: {mask_path}", "INFO")
+    debug_print(f"Segmentation output: {segmentation_output}", "INFO")
+
+    # Step 2: LaMa Inpainting
+    debug_print("\n[STEP 2/2] Running LaMa inpainting...", "INFO")
+    inpaint_result = run_inpaint_removal(
+        image_path=image_path,
+        mask_path=mask_path,
+    )
+
+    if inpaint_result.get("error"):
+        error_msg = f"Inpainting failed: {inpaint_result.get('error')}"
+        debug_print(error_msg, "ERROR")
+        return {
+            "error": error_msg,
+            "mask_path": mask_path,
+            "segmentation_output": segmentation_output,
+        }
+
+    output_image_path = inpaint_result.get("output_image_path")
+
+    if not output_image_path:
+        error_msg = "Inpainting did not produce an output image"
+        debug_print(error_msg, "ERROR")
+        return {
+            "error": error_msg,
+            "mask_path": mask_path,
+            "segmentation_output": segmentation_output,
+        }
+
+    debug_print("=" * 60, "INFO")
+    debug_print("OBJECT REMOVAL PIPELINE COMPLETED", "INFO")
+    debug_print("=" * 60, "INFO")
+    debug_print(f"Output image: {output_image_path}", "INFO")
+
+    return {
+        "output_image_path": output_image_path,
+        "mask_path": mask_path,
+        "segmentation_output": segmentation_output,
+        "sam_result": sam_result,
+        "inpaint_result": inpaint_result,
+    }
+
+
+def test_object_removal(
+    image_path: str = None,
+    x: int = 150,
+    y: int = 200,
+):
+    """Test the complete object removal pipeline."""
+    print("\n--- Object Removal Pipeline Test ---")
+
+    if image_path is None:
+        image_path = DEFAULT_CONTENT_IMAGE
+
+    debug_print(f"Image: {image_path}", "REQUEST")
+    debug_print(f"Target point: ({x}, {y})", "REQUEST")
+
+    result = run_object_removal_pipeline(
+        image_path=image_path,
+        x=x,
+        y=y,
+    )
+
+    if result.get("error"):
+        debug_print(f"Pipeline error: {result.get('error')}", "ERROR")
+    else:
+        debug_print(f"Pipeline result: {json.dumps(result, indent=2)}", "RESPONSE")
+
+    return result
+
+
 def ai_editing_flow(image_path, user_prompt):
     """Legacy test function - wraps run_ai_editing_pipeline with logging."""
     print("\n" + "=" * 60)
