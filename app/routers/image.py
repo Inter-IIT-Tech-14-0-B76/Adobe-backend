@@ -26,6 +26,7 @@ from app.helpers.s3 import (
     _s3_put_object_sync,
 )
 from app.helpers.test_server import run_ai_editing_pipeline, run_object_removal_pipeline
+from app.helpers.object_removal import get_object_center
 from app.utils.db import async_session
 from app.utils.models import Image, ImageActionType, Project, VersionHistory
 from config import WORKSPACE_OUTPUT_DIR, WORKSPACE_SERVER
@@ -847,8 +848,7 @@ async def add_image_to_project(
 async def remove_object_at_point(
     project_id: str,
     token_payload: Dict = Depends(verify_firebase_token),
-    x: int = Body(..., description="X coordinate of the object to remove"),
-    y: int = Body(..., description="Y coordinate of the object to remove"),
+    xy_json: str = Body(..., embed=True, description="JSON with normalized x,y points"), 
     session: AsyncSession = Depends(async_session),
 ):
     """
@@ -889,6 +889,8 @@ async def remove_object_at_point(
 
     if not source_image.object_key:
         raise HTTPException(status_code=400, detail="Source image has no S3 object key")
+    
+    x, y = get_object_center(xy_json)
 
     print(f"[INFO] Object removal for project {project_id}")
     print(f"[INFO] Point: ({x}, {y})")
