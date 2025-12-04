@@ -16,6 +16,8 @@ from fastapi import (
 from sqlmodel import col, desc, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+import requests
+
 from app.helpers.auth import upsert_user_from_token, verify_firebase_token
 from app.helpers.s3 import (
     _compute_sha256,
@@ -26,7 +28,32 @@ from app.helpers.s3 import (
 from app.helpers.test_server import run_ai_editing_pipeline
 from app.utils.db import async_session
 from app.utils.models import Image, ImageActionType, Project, VersionHistory
-from config import WORKSPACE_OUTPUT_DIR
+from config import WORKSPACE_OUTPUT_DIR, WORKSPACE_SERVER
+
+
+def _get_ai_suggestions(image_path: str) -> Dict:
+    """
+    Call the AI suggestions endpoint to get editing suggestions for an image.
+
+    Args:
+        image_path: Path to the image file
+
+    Returns:
+        Dict with image_summary and edit_prompts, or error dict
+    """
+    try:
+        url = f"{WORKSPACE_SERVER}/ai-suggestions"
+        payload = {"image": image_path}
+        response = requests.post(url, json=payload, timeout=60)
+
+        if response.status_code != 200:
+            return {"error": f"AI suggestions failed with status {response.status_code}"}
+
+        return response.json()
+    except requests.exceptions.Timeout:
+        return {"error": "AI suggestions request timed out"}
+    except Exception as e:
+        return {"error": f"AI suggestions error: {str(e)}"}
 
 
 async def _delete_future_versions(session: AsyncSession, parent_id: str):
@@ -275,6 +302,7 @@ async def upload_physical_image(
                     pass
             raise HTTPException(status_code=500, detail=f"AI pipeline error: {str(e)}")
     else:
+        # No prompt provided - get AI suggestions for the uploaded image
         project.current_version_id = version_1.id
         session.add(project)
 
@@ -287,6 +315,57 @@ async def upload_physical_image(
             img_dict = img.public_dict()
             img_dict["presigned_url"] = _s3_presign_sync(img.object_key)
             resp["images"].append(img_dict)
+
+        # Call AI suggestions pipeline for the first uploaded image
+        if input_images:
+            # Save image locally to call AI suggestions
+            first_image = input_images[0]
+            WORKSPACE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            local_path = WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{first_image.file_name or 'image'}"
+
+            try:
+                # Download from S3 to local path for AI suggestions
+                image_bytes = await anyio.to_thread.run_sync(
+                    _s3_get_object_bytes_sync, first_image.object_key
+                )
+
+                def write_file():
+                    local_path.write_bytes(image_bytes)
+
+                await anyio.to_thread.run_sync(write_file)
+
+                # Get AI suggestions
+                suggestions_result = await anyio.to_thread.run_sync(
+                    lambda: _get_ai_suggestions(str(local_path))
+                )
+
+                if not suggestions_result.get("error"):
+                    resp["suggestions"] = {
+                        "image_summary": suggestions_result.get("image_summary", ""),
+                        "edit_prompts": suggestions_result.get("edit_prompts", []),
+                    }
+                else:
+                    print(f"[WARN] AI suggestions failed: {suggestions_result.get('error')}")
+                    resp["suggestions"] = None
+
+                # Cleanup local file
+                if local_path.exists():
+                    def delete_file():
+                        local_path.unlink()
+                    await anyio.to_thread.run_sync(delete_file)
+
+            except Exception as e:
+                print(f"[WARN] Failed to get AI suggestions: {str(e)}")
+                resp["suggestions"] = None
+                # Cleanup on error
+                if local_path.exists():
+                    try:
+                        def delete_file():
+                            local_path.unlink()
+                        await anyio.to_thread.run_sync(delete_file)
+                    except Exception:
+                        pass
+
         return resp
 
 
@@ -522,19 +601,23 @@ async def process_with_prompt(
     "/images/upload/{project_id}",
     status_code=201,
     summary="Add image to project (New Version)",
-    description="Adds a new image to the current sequence. Does NOT duplicate existing images, just appends the ID.",
+    description="Adds a new image to the current sequence. If prompt is provided, runs AI editing pipeline. Otherwise returns AI suggestions.",
 )
 async def add_image_to_project(
     project_id: str,
     token_payload: Dict = Depends(verify_firebase_token),
     file: UploadFile = File(...),
     action_type: ImageActionType = Form(ImageActionType.UPLOAD),
+    prompt: Optional[str] = Form(None),
+    generation_params_str: Optional[str] = Form(None),
     session: AsyncSession = Depends(async_session),
 ):
     uploader = await upsert_user_from_token(token_payload, session)
     project = await session.get(Project, project_id)
     if not project or project.user_id != uploader.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
+
+    gen_params = json.loads(generation_params_str) if generation_params_str else {}
 
     parent_version = None
     previous_image_ids = []
@@ -561,39 +644,192 @@ async def add_image_to_project(
         sha256_hash=sha256_hash,
         action_type=action_type,
         is_virtual=False,
+        generation_params=gen_params,
     )
     session.add(new_image)
     await session.flush()
 
     new_state_ids = previous_image_ids + [new_image.id]
 
-    new_version = VersionHistory(
+    # Create initial version with uploaded image
+    version_1 = VersionHistory(
         id=str(uuid4()),
         project_id=project.id,
         parent_id=parent_version.id if parent_version else None,
         image_ids=new_state_ids,
-        prompt=parent_version.prompt if parent_version else None,
+        prompt=None,
         output_logs="Added new image asset",
     )
-    session.add(new_version)
-
+    session.add(version_1)
     await session.flush()
 
-    project.current_version_id = new_version.id
-    session.add(project)
+    # If prompt is provided, run AI editing pipeline
+    if prompt:
+        WORKSPACE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        local_input_path = WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{file.filename or 'image'}"
 
-    await session.commit()
+        try:
+            def write_file():
+                local_input_path.write_bytes(contents)
 
-    full_images = await _fetch_images_by_ids(session, new_state_ids)
+            await anyio.to_thread.run_sync(write_file)
 
-    resp = new_version.public_dict()
-    resp["images"] = []
-    for img in full_images:
-        d = img.public_dict()
-        d["presigned_url"] = _s3_presign_sync(img.object_key)
-        resp["images"].append(d)
+            # Run AI pipeline
+            pipeline_result = await anyio.to_thread.run_sync(
+                lambda: run_ai_editing_pipeline(
+                    image_path=str(local_input_path),
+                    user_prompt=prompt,
+                )
+            )
 
-    return resp
+            if pipeline_result.get("error"):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"AI pipeline failed: {pipeline_result.get('error')}",
+                )
+
+            output_image_path = pipeline_result.get("output_image_path")
+            if not output_image_path or not Path(output_image_path).exists():
+                raise HTTPException(
+                    status_code=500, detail="AI pipeline did not produce output image"
+                )
+
+            def read_output():
+                return Path(output_image_path).read_bytes()
+
+            output_contents = await anyio.to_thread.run_sync(read_output)
+            output_sha256 = _compute_sha256(output_contents)
+            output_filename = Path(output_image_path).name
+            output_object_key = (
+                f"project/{project.id}/assets/{output_sha256}/{output_filename}"
+            )
+
+            await anyio.to_thread.run_sync(
+                _s3_put_object_sync, output_object_key, output_contents, "image/png"
+            )
+
+            output_image = Image(
+                id=str(uuid4()),
+                project_id=project.id,
+                parent_image_id=new_image.id,
+                object_key=output_object_key,
+                file_name=output_filename,
+                mime_type="image/png",
+                sha256_hash=output_sha256,
+                action_type=ImageActionType.GENERATE,
+                is_virtual=False,
+                transformations={},
+                generation_params={
+                    **gen_params,
+                    "pipeline_result": pipeline_result,
+                    "prompt": prompt,
+                },
+            )
+            session.add(output_image)
+            await session.flush()
+
+            version_2 = VersionHistory(
+                id=str(uuid4()),
+                project_id=project.id,
+                parent_id=version_1.id,
+                image_ids=[output_image.id],
+                prompt=prompt,
+                output_logs=f"AI processed with prompt: {prompt}",
+            )
+            session.add(version_2)
+            await session.flush()
+
+            project.current_version_id = version_2.id
+            session.add(project)
+
+            # Cleanup local files
+            if local_input_path.exists():
+                def delete_file():
+                    local_input_path.unlink()
+                await anyio.to_thread.run_sync(delete_file)
+
+            await session.commit()
+            await session.refresh(version_2)
+
+            resp = version_2.public_dict()
+            resp["images"] = []
+            img_dict = output_image.public_dict()
+            img_dict["presigned_url"] = _s3_presign_sync(output_image.object_key)
+            resp["images"].append(img_dict)
+            return resp
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Cleanup on error
+            if local_input_path.exists():
+                try:
+                    def delete_file():
+                        local_input_path.unlink()
+                    await anyio.to_thread.run_sync(delete_file)
+                except Exception:
+                    pass
+            raise HTTPException(status_code=500, detail=f"AI pipeline error: {str(e)}")
+    else:
+        # No prompt - return with AI suggestions
+        project.current_version_id = version_1.id
+        session.add(project)
+
+        await session.commit()
+        await session.refresh(version_1)
+
+        full_images = await _fetch_images_by_ids(session, new_state_ids)
+
+        resp = version_1.public_dict()
+        resp["images"] = []
+        for img in full_images:
+            d = img.public_dict()
+            d["presigned_url"] = _s3_presign_sync(img.object_key)
+            resp["images"].append(d)
+
+        # Get AI suggestions for the newly uploaded image
+        WORKSPACE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        local_path = WORKSPACE_OUTPUT_DIR / f"{uuid4().hex}_{file.filename or 'image'}"
+
+        try:
+            def write_file():
+                local_path.write_bytes(contents)
+
+            await anyio.to_thread.run_sync(write_file)
+
+            # Get AI suggestions
+            suggestions_result = await anyio.to_thread.run_sync(
+                lambda: _get_ai_suggestions(str(local_path))
+            )
+
+            if not suggestions_result.get("error"):
+                resp["suggestions"] = {
+                    "image_summary": suggestions_result.get("image_summary", ""),
+                    "edit_prompts": suggestions_result.get("edit_prompts", []),
+                }
+            else:
+                print(f"[WARN] AI suggestions failed: {suggestions_result.get('error')}")
+                resp["suggestions"] = None
+
+            # Cleanup local file
+            if local_path.exists():
+                def delete_file():
+                    local_path.unlink()
+                await anyio.to_thread.run_sync(delete_file)
+
+        except Exception as e:
+            print(f"[WARN] Failed to get AI suggestions: {str(e)}")
+            resp["suggestions"] = None
+            # Cleanup on error
+            if local_path.exists():
+                try:
+                    def delete_file():
+                        local_path.unlink()
+                    await anyio.to_thread.run_sync(delete_file)
+                except Exception:
+                    pass
+
+        return resp
 
 
 @image_router.post(
