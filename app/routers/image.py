@@ -293,8 +293,19 @@ async def upload_physical_image(
 @image_router.post(
     "/projects/{project_id}/prompt",
     status_code=201,
-    summary="Process image with AI prompt",
-    description="Takes the latest image from the current version, runs AI pipeline with the provided prompt, and creates a new version with the result.",
+    summary="Process image with AI prompt (Chat Interface)",
+    description="""
+    Chat-like interface for image editing. Takes the latest image(s) from the
+    current version and processes them with the AI pipeline based on the prompt.
+
+    Special prompt prefixes:
+    - "Remix: <prompt>" - Forces ComfyUI remix (2 images) or edit (1 image) pipeline
+    - Regular prompts are classified automatically to determine the best pipeline
+
+    The pipeline selection is based on:
+    - Number of images in current version
+    - Prompt classification (style_transfer, color_grading, default, etc.)
+    """,
 )
 async def process_with_prompt(
     project_id: str,
@@ -303,6 +314,12 @@ async def process_with_prompt(
     generation_params_str: Optional[str] = Body(None, embed=True),
     session: AsyncSession = Depends(async_session),
 ):
+    """
+    Chat-like image editing endpoint.
+
+    Uses the last image(s) from the project's current version and applies
+    AI transformations based on the prompt.
+    """
     uploader = await upsert_user_from_token(token_payload, session, set_last_login=True)
     if not uploader:
         raise HTTPException(status_code=401, detail="User invalid")
@@ -327,12 +344,12 @@ async def process_with_prompt(
             detail="Current version has no images. Please upload an image first.",
         )
 
-    # Fetch all images from current version (for multi-image scenarios like style_transfer_ref)
+    # Fetch all images from current version
     all_source_images = await _fetch_images_by_ids(session, current_version.image_ids)
     if not all_source_images:
         raise HTTPException(status_code=404, detail="Source images not found")
 
-    # Primary source image is the last one
+    # Primary source image is the last one (most recent in the chat flow)
     source_image = all_source_images[-1]
 
     if not source_image.object_key:
@@ -342,7 +359,12 @@ async def process_with_prompt(
 
     WORKSPACE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Download all images for multi-image pipeline support
+    num_images = len(all_source_images)
+    print(f"[INFO] Processing prompt for project {project_id}")
+    print(f"[INFO] Prompt: {prompt}")
+    print(f"[INFO] Number of source images: {num_images}")
+
+    # Download all images for pipeline
     local_input_paths = []
     try:
         for img in all_source_images:
@@ -364,9 +386,13 @@ async def process_with_prompt(
         if not local_input_paths:
             raise HTTPException(status_code=400, detail="No valid images to process")
 
-        input_path = str(local_input_paths[-1])  # Primary image (last one)
+        # Primary image is the last one (for single-image operations)
+        input_path = str(local_input_paths[-1])
         all_image_paths = [str(p) for p in local_input_paths]
 
+        print(f"[INFO] Input paths: {all_image_paths}")
+
+        # Run AI pipeline - it handles Remix: prefix and default classification internally
         pipeline_result = await anyio.to_thread.run_sync(
             lambda: run_ai_editing_pipeline(
                 image_path=input_path,
@@ -376,6 +402,7 @@ async def process_with_prompt(
         )
 
         if pipeline_result.get("error"):
+            print(f"[ERROR] Pipeline failed: {pipeline_result.get('error')}")
             raise HTTPException(
                 status_code=500,
                 detail=f"AI pipeline failed: {pipeline_result.get('error')}",
@@ -383,9 +410,12 @@ async def process_with_prompt(
 
         output_image_path = pipeline_result.get("output_image_path")
         if not output_image_path or not Path(output_image_path).exists():
+            print(f"[ERROR] No output image produced. Result: {pipeline_result}")
             raise HTTPException(
                 status_code=500, detail="AI pipeline did not produce output image"
             )
+
+        print(f"[INFO] Output image: {output_image_path}")
 
         def read_output():
             return Path(output_image_path).read_bytes()
@@ -421,6 +451,8 @@ async def process_with_prompt(
         session.add(output_image)
         await session.flush()
 
+        # Create new version with just the output image
+        # This creates a clean chain in the chat flow
         new_version = VersionHistory(
             id=str(uuid4()),
             project_id=project_id,
@@ -444,6 +476,18 @@ async def process_with_prompt(
 
                 await anyio.to_thread.run_sync(delete_file)
 
+        # Also clean up output file if it exists
+        try:
+            output_path_obj = Path(output_image_path)
+            if output_path_obj.exists():
+
+                def delete_output():
+                    output_path_obj.unlink()
+
+                await anyio.to_thread.run_sync(delete_output)
+        except Exception:
+            pass
+
         await session.commit()
         await session.refresh(new_version)
 
@@ -452,11 +496,14 @@ async def process_with_prompt(
         img_dict = output_image.public_dict()
         img_dict["presigned_url"] = _s3_presign_sync(output_image.object_key)
         resp["images"].append(img_dict)
+
+        print(f"[INFO] Successfully created version {new_version.id}")
         return resp
 
     except HTTPException:
         raise
     except Exception as e:
+        print(f"[ERROR] Pipeline exception: {str(e)}")
         # Clean up all local input files on error
         for local_path in local_input_paths:
             if local_path.exists():

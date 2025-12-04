@@ -515,6 +515,81 @@ def test_sam_segment(
 # =============================================================================
 
 
+def _is_remix_prompt(prompt: str) -> tuple[bool, str]:
+    """
+    Check if prompt starts with 'Remix:' prefix.
+    Returns (is_remix, cleaned_prompt).
+    """
+    if not prompt:
+        return False, prompt
+    prompt_stripped = prompt.strip()
+    if prompt_stripped.lower().startswith("remix:"):
+        # Extract the actual prompt after "Remix:"
+        cleaned = prompt_stripped[6:].strip()
+        return True, cleaned
+    return False, prompt
+
+
+def _run_comfy_pipeline(
+    image_paths: list,
+    prompt: str,
+    num_images: int,
+) -> Dict[str, Any]:
+    """
+    Run ComfyUI pipeline based on number of images.
+    - 2+ images: comfy-remix (combine images)
+    - 1 image: comfy-edit (edit single image with prompt)
+
+    Args:
+        image_paths: List of image paths
+        prompt: The editing prompt (already cleaned of "Remix:" prefix if applicable)
+        num_images: Number of images
+
+    Returns:
+        Dict with result or error
+    """
+    debug_print(f"Running ComfyUI pipeline with {num_images} image(s)", "INFO")
+
+    if num_images >= 2:
+        # Use comfy-remix for 2+ images
+        tool = "comfy-remix"
+        params = {
+            "image1": image_paths[0],
+            "image2": image_paths[1],
+        }
+        primary_image = image_paths[0]
+        debug_print(f"Using comfy-remix: image1={image_paths[0]}, image2={image_paths[1]}", "INFO")
+    else:
+        # Use comfy-edit for single image
+        tool = "comfy-edit"
+        params = {}
+        primary_image = image_paths[0]
+        debug_print(f"Using comfy-edit: image={image_paths[0]}", "INFO")
+
+    try:
+        result = execute_tool(
+            tool=tool,
+            image_path=primary_image,
+            prompt=prompt,
+            params=params,
+            ai_suggestions={},  # Not needed for ComfyUI
+        )
+
+        if result.get("error"):
+            debug_print(f"ComfyUI tool error: {result.get('error')}", "ERROR")
+            return result
+
+        debug_print("ComfyUI pipeline completed successfully", "INFO")
+        debug_print(f"Result: {json.dumps(result, indent=2)}", "RESPONSE")
+        return result
+
+    except Exception as e:
+        error_msg = f"ComfyUI pipeline error: {str(e)}"
+        debug_print(error_msg, "ERROR")
+        traceback.print_exc()
+        return {"error": error_msg}
+
+
 def run_ai_editing_pipeline(
     image_path: str,
     user_prompt: str,
@@ -524,10 +599,16 @@ def run_ai_editing_pipeline(
     """
     Run the complete AI editing pipeline: Analyze -> Classify -> Execute Tool.
 
+    Special handling:
+    - If prompt starts with "Remix:", uses ComfyUI endpoints:
+      - 2+ images: comfy-remix
+      - 1 image: comfy-edit
+    - If classifier returns "default", uses ComfyUI endpoints based on image count
+
     Args:
         image_path: Path to the input image file (primary/first image)
         user_prompt: User's editing prompt/request
-        image_paths: Optional list of all image paths (for multi-image scenarios like style_transfer_ref)
+        image_paths: Optional list of all image paths (for multi-image scenarios)
         image_analyses: Optional list of image analysis dicts (one per image)
 
     Returns:
@@ -543,6 +624,16 @@ def run_ai_editing_pipeline(
     debug_print(f"Image(s): {image_paths}", "INFO")
     debug_print(f"Number of images: {num_images}", "INFO")
     debug_print(f"Prompt: {user_prompt}", "INFO")
+
+    # Check for "Remix:" prefix - bypass classification entirely
+    is_remix, cleaned_prompt = _is_remix_prompt(user_prompt)
+    if is_remix:
+        debug_print("Detected 'Remix:' prefix - using ComfyUI pipeline", "INFO")
+        return _run_comfy_pipeline(
+            image_paths=image_paths,
+            prompt=cleaned_prompt,
+            num_images=num_images,
+        )
 
     # Step 1: Analyze image
     debug_print("\n[STEP 1/3] Analyzing image...", "INFO")
@@ -668,7 +759,15 @@ def run_ai_editing_pipeline(
                 params["content_image"] = (
                     image_paths[1] if len(image_paths) > 1 else image_paths[0]
                 )
-        elif tool == "default_mode" or tool == "style_transfer":
+        elif tool == "default" or tool == "default_mode":
+            # "default" classification -> use ComfyUI pipeline based on image count
+            debug_print("Classification is 'default' - routing to ComfyUI pipeline", "INFO")
+            return _run_comfy_pipeline(
+                image_paths=image_paths,
+                prompt=user_prompt,
+                num_images=num_images,
+            )
+        elif tool == "style_transfer":
             tool = "style-transfer-text"
         elif tool == "color_grading":
             tool = "color-grading"
@@ -752,6 +851,9 @@ def execute_tool(tool, image_path, prompt, params, ai_suggestions):
         "style-transfer-ref": "/style-transfer/ref",
         "color-grading": "/color-grading",
         "segmentation": "/sam/segment",
+        "comfy-edit": "/comfy/edit",
+        "comfy-remix": "/comfy/remix",
+        "comfy-inpaint": "/comfy/inpaint",
     }
 
     endpoint = tool_endpoints.get(tool)
@@ -817,6 +919,12 @@ def execute_tool(tool, image_path, prompt, params, ai_suggestions):
                 or result.get("output")
                 or result.get("mask")
             )
+        elif tool in ("comfy-edit", "comfy-remix", "comfy-inpaint"):
+            # ComfyUI endpoints return output_images list
+            output_images = result.get("output_images", [])
+            if output_images:
+                output_path = output_images[0]  # Take first output
+            debug_print(f"ComfyUI output images: {output_images}", "INFO")
 
         if output_path:
             result["output_image_path"] = output_path
@@ -881,6 +989,22 @@ def build_tool_payload(
             "x": params.get("x", 150),
             "y": params.get("y", 200),
             "output_dir": "/workspace/AIP/workspace/outputs/segmentation",
+        }
+    elif tool == "comfy-edit":
+        payload = {
+            "image": image_path,
+            "prompt": prompt,
+        }
+    elif tool == "comfy-remix":
+        payload = {
+            "image1": params.get("image1", image_path),
+            "image2": params.get("image2", ""),
+            "prompt": prompt,
+        }
+    elif tool == "comfy-inpaint":
+        payload = {
+            "image": image_path,
+            "mask": params.get("mask", ""),
         }
     else:
         payload = {"image": image_path, "prompt": prompt}
