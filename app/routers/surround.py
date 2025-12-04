@@ -256,7 +256,7 @@ async def create_surround_project(
 
 
 @surround_router.get(
-    "/surround/{surround_id}/video",
+    "/surround/{surround_id}/prompt",
     status_code=200,
     summary="Get video S3 URL for project",
     description="""
@@ -855,3 +855,4 @@ async def get_glb_by_project_id(
         token_payload=token_payload,
         session=session,
     )
+
